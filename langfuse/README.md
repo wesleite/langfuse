@@ -306,3 +306,4 @@ renderizado — incluindo o script de init do subchart Valkey, que lê a senha A
 `/valkey-users-secret/default` (montado a partir do nosso Secret `langfuse`), e os
 containers de `postgresql` recebendo `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
 `USERDB_USER`/`USERDB_PASSWORD` via `secretKeyRef` do mesmo Secret.
+
