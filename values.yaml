@@ -1,0 +1,52 @@
+# ==============================================================================
+# Values do Langfuse — arquivo base
+# ------------------------------------------------------------------------------
+# As configurações de cada serviço foram separadas em arquivos próprios:
+#   - web.yaml         -> langfuse (salt/encryptionKey/nextauth/additionalEnv + web)
+#   - worker.yaml      -> langfuse (salt/encryptionKey/nextauth/additionalEnv + worker)
+#   - postgres.yaml    -> postgresql
+#   - redis.yaml       -> redis
+#   - clickhouse.yaml  -> clickhouse
+#
+# Credenciais de todos os serviços vêm do Secret "langfuse" definido em
+# secrets.yaml — aplicar com `kubectl apply -f secrets.yaml` ANTES do
+# helm install/upgrade (ver DEPLOY.md).
+#
+# Use todos juntos no deploy, por exemplo:
+#   kubectl apply -f secrets.yaml
+#   helm upgrade --install langfuse langfuse/langfuse \
+#     -f values.yaml \
+#     -f web.yaml \
+#     -f worker.yaml \
+#     -f postgres.yaml \
+#     -f redis.yaml \
+#     -f clickhouse.yaml
+# ==============================================================================
+
+# ==============================================================================
+# Storage S3 / MinIO Local
+# ------------------------------------------------------------------------------
+# Correção: `s3.auth.accessKeyId/secretAccessKey` (string simples) não existe
+# no schema real do chart — e o bloco `s3.auth.*` do chart é para as
+# credenciais do gateway SeaweedFS embutido (não usado aqui, `s3.deploy:
+# false`). As credenciais do Langfuse para o S3/MinIO externo são
+# `s3.accessKeyId`/`s3.secretAccessKey` (objetos `{value|secretKeyRef}`).
+# ==============================================================================
+seaweedfs:
+  enabled: false
+
+s3:
+  deploy: false
+  storageProvider: "s3"
+  bucket: "langfuse"
+  region: "us-east-1"
+  endpoint: "http://minio:9000"
+  forcePathStyle: true
+  accessKeyId:
+    secretKeyRef:
+      name: langfuse
+      key: s3-access-key
+  secretAccessKey:
+    secretKeyRef:
+      name: langfuse
+      key: s3-secret-key
