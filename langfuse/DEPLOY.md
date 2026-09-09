@@ -64,6 +64,36 @@ kubectl get pods -n clickhouse-operator-system
 kubectl get crd | grep clickhouse.com   # deve listar clickhousecluster e keepercluster
 ```
 
+### 0.5. Pré-requisitos ADICIONAIS para Amazon EKS
+
+Só se aplicam quando for usar `eks.yaml` (overlay de produção — Ingress ALB, S3 real
+via IRSA, StorageClass gp3). O Kind/Docker Compose não precisam disso.
+
+- **AWS Load Balancer Controller** instalado no cluster (fornece a `IngressClassName: alb`
+  usada por `eks.yaml`)
+- **Addon EBS CSI Driver** habilitado no cluster + **StorageClass `gp3`** criada
+  (nem todo cluster EKS vem com uma por padrão)
+- **Bucket S3** real criado
+- **IAM Role (IRSA)** com permissão de leitura/escrita nesse bucket, associada à
+  Service Account do Langfuse via `eks.amazonaws.com/role-arn` — sem access
+  key/secret key fixos, autenticação por identidade do pod
+- **Certificado ACM** emitido para o domínio público (referenciado no Ingress)
+
+```bash
+# Verificar
+kubectl get pods -n kube-system | grep -i aws-load-balancer
+kubectl get sa -n kube-system aws-load-balancer-controller 2>&1
+kubectl get storageclass gp3
+```
+
+Depois de gerar/editar `eks.yaml` com os valores reais (domínio, ARNs, bucket,
+região — todos marcados com `<...>` no arquivo), inclua-o **por último** em todos
+os comandos `helm template`/`install`/`upgrade` das seções 4, 5, 8 e 9 abaixo:
+
+```bash
+-f values.yaml -f web.yaml -f worker.yaml -f postgres.yaml -f redis.yaml -f clickhouse.yaml -f eks.yaml
+```
+
 ---
 
 ## 1. Criar o namespace
@@ -114,9 +144,18 @@ Para produção, ajuste também a URL pública em `langfuse.nextauth.url` (`web.
 `--set langfuse.nextauth.url=https://langfuse.seudominio.com` no install/upgrade sem
 editar os arquivos.
 
+**Deploy em EKS**: use `eks.yaml` (seção 0.5) em vez de editar `secrets.yaml`/`--set`
+manualmente — ele já sobrescreve `langfuse.nextauth.url`, S3 (real, via IRSA) e
+StorageClass. Para as senhas de banco/cache/ClickHouse em produção, prefira gerar
+`secrets.yaml` a partir de um secret manager (AWS Secrets Manager + External Secrets
+Operator) em vez de editar o YAML de laboratório à mão.
+
 ---
 
 ## 4. Validar o template antes de aplicar (dry-run)
+
+> Em deploy no **EKS**, adicione `-f eks.yaml` por último em todos os comandos
+> `helm` desta seção em diante (template/install/upgrade) — ver seção 0.5.
 
 ```bash
 helm template langfuse langfuse/langfuse \

@@ -61,7 +61,7 @@ flowchart TB
 | **redis** (Valkey) | Filas de ingestão e cache | `docker.io/valkey/valkey:8.0` (subchart `valkey-io/valkey`) | `redis.yaml` | 1 (standalone) | 8Gi (default do chart, não sobrescrito) |
 | **clickhouse** | Armazenamento analítico de traces/observações | `clickhouse/clickhouse-server:26.4` (CR `ClickHouseCluster` via ClickHouse Operator) | `clickhouse.yaml` | 1 (cluster habilitado) | 3Gi |
 | **clickhouse-keeper** | Coordenação/consenso do cluster ClickHouse | `clickhouse/clickhouse-keeper:26.4` (CR `KeeperCluster`) | `clickhouse.yaml` | 3 | 3Gi cada |
-| **s3/MinIO** | Armazenamento de objetos (eventos, mídia, exports) | externo (`s3.deploy: false`; chart também oferece SeaweedFS bundled via `seaweedfs.enabled`, aqui desativado) | `values.yaml` | — | — |
+| **s3/MinIO** | Armazenamento de objetos (eventos, mídia, exports) | externo (`s3.deploy: false`; chart também oferece SeaweedFS bundled via `seaweedfs.enabled`, aqui desativado) | `values.yaml` (local) / `eks.yaml` (S3 real via IRSA) | — | — |
 
 Todas as credenciais acima vêm de **um único arquivo, `secrets.yaml`** (um `Secret`
 Kubernetes chamado `langfuse`, no namespace `langfuse`) — ver seção 5.
@@ -105,6 +105,15 @@ Confirmado via documentação oficial (Context7) e documentação oficial do Cli
 
 Procedimento completo (com comandos de verificação) em **[DEPLOY.md](./DEPLOY.md)**,
 seção 0.
+
+### Amazon EKS (produção/homolog)
+
+Além dos pré-requisitos acima, deploy em EKS precisa de: **AWS Load Balancer
+Controller** (Ingress ALB), **EBS CSI Driver + StorageClass `gp3`**, um **bucket S3**
+real e uma **IAM Role (IRSA)** associada à Service Account do Langfuse. O arquivo
+**`eks.yaml`** (overlay aplicado por cima dos demais) já traz esses ajustes prontos
+— só falta trocar os placeholders `<...>` (domínio, ARNs, bucket, região). Detalhes
+completos em **[DEPLOY.md](./DEPLOY.md)**, seção 0.5.
 
 ### Ambiente local (custo zero)
 
@@ -241,6 +250,7 @@ langfuse/
 ├── postgres.yaml             # postgresql (existingSecret -> secrets.yaml)
 ├── redis.yaml                 # redis/Valkey (existingSecret -> secrets.yaml)
 ├── clickhouse.yaml            # clickhouse + keeper (existingSecret -> secrets.yaml)
+├── eks.yaml                   # overlay opcional p/ Amazon EKS (Ingress ALB, S3 real/IRSA, StorageClass gp3)
 ├── docker/
 │   ├── web/Dockerfile
 │   ├── worker/Dockerfile
@@ -282,7 +292,8 @@ independente dentro do próprio cluster Kubernetes do cliente.
 |---|---|---|
 | `secrets.yaml` contém todas as senhas em texto claro (valores de laboratório) | Alto | Nunca commitar com valores reais; usar secret manager externo em homolog/prod (ver seção 5) |
 | Postgres, Redis e ClickHouse com 1 réplica cada (exceto Keeper) | Médio | Sem HA real; avaliar `cluster.replicas`/`web.replicas`/`worker.replicas` maiores para homolog/prod |
-| Sem `NetworkPolicy` / `Ingress` / TLS definidos | Médio | Adicionar antes de expor publicamente |
+| Sem `NetworkPolicy` definida | Médio | Adicionar antes de expor publicamente |
+| Ingress/TLS (`eks.yaml`) usa placeholders (`<SEU_DOMINIO>`, ARNs) — não funciona até serem substituídos | Alto (só em EKS) | Preencher antes do deploy; `helm template` não valida se são reais |
 | ClickHouse Operator + cert-manager são pré-requisitos externos ao chart | Médio | Comandos de instalação documentados na seção 4 / `DEPLOY.md` seção 0 |
 | ClickHouse Kubernetes Operator é classificado como *alpha-quality* pelo próprio chart do Langfuse (comentário no `values.yaml` oficial) | Médio | Revisar release notes antes de upgrades; fixar a versão do operator explicitamente (`--set manager.image.tag=<versão>`) em vez de usar sempre "latest" |
 | Imagens Docker customizadas ainda não fixam SHA256 (só tag) | Baixo | Fixar digest antes de produção |
@@ -293,8 +304,10 @@ independente dentro do próprio cluster Kubernetes do cliente.
 |---|---|---|
 | Compute (nós do cluster) | CPU/memória para web, worker, postgres, redis, clickhouse e 3 keepers rodando simultaneamente | Requests somados: ~425m CPU / ~2.9Gi mem (sem contar keeper, sem limite definido) |
 | Armazenamento (PV/EBS) | Persistência de Postgres (2Gi) + ClickHouse (3Gi) + Keeper (3× 3Gi = 9Gi) | Total ≈ 14Gi de volumes persistentes |
-| S3 / object storage | Eventos e mídia do Langfuse (`values.yaml`) | Zero custo se usar MinIO/LocalStack local; custo real de S3 se apontar para AWS |
+| S3 / object storage | Eventos e mídia do Langfuse (`values.yaml`) | Zero custo se usar MinIO/LocalStack local; custo real de S3 (armazenamento + requests) em EKS via `eks.yaml` |
 | Rede (data transfer) | Tráfego entre web/worker e os bancos, e ingress externo | Baixo em cluster único; considerar se multi-AZ/multi-região |
+| ALB (`eks.yaml`, EKS only) | Load Balancer do Ingress (AWS Load Balancer Controller) | Custo fixo por hora + por LCU; certificado ACM em si é gratuito |
+| EBS gp3 (`eks.yaml`, EKS only) | Volumes de Postgres/ClickHouse/Keeper via StorageClass `gp3` | Substitui o `standard` (local-path) do Kind, que não tem custo |
 | Licenciamento | Nenhum — Langfuse é open source (self-hosted) | Sem custo de software |
 
 > Estimativa qualitativa — não há preços fechados pois depende do provedor
