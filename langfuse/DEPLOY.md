@@ -1,10 +1,15 @@
 # Procedimento de Deploy — Stack Langfuse
 
-> Passo a passo para implantar a stack via Helm. Baseado na documentação oficial do
-> Langfuse (Context7 `/langfuse/langfuse-docs`) e na documentação oficial do
-> ClickHouse (clickhouse.com/docs) para os passos do operator/cert-manager — ver
-> fontes na seção 0.3. Consulte também `README.md` para a visão geral da
-> arquitetura, riscos e segredos obrigatórios.
+> Passo a passo para implantar a stack via Helm. Baseado na documentação oficial:
+> [github.com/langfuse/langfuse-k8s](https://github.com/langfuse/langfuse-k8s) (README +
+> `charts/langfuse/values.yaml` + `examples/minimal-installation/`), Context7
+> (`/langfuse/langfuse-docs`) e a documentação oficial do ClickHouse
+> (clickhouse.com/docs) para os passos do operator/cert-manager — ver seção 0.3.
+> Consulte também `README.md` para a visão geral da arquitetura, riscos e segredos.
+>
+> ⚠️ Esta stack assume **Amazon EKS** como alvo padrão (Ingress ALB, S3 via IAM Role/IRSA,
+> StorageClass `gp3` já vêm configurados em `web.yaml`/`worker.yaml`/`postgres.yaml`). Para
+> testar em **Kind/local**, veja os overrides na seção 4.1.
 
 ---
 
@@ -14,7 +19,7 @@
 
 ```bash
 kubectl version --short          # Client/Server >= 1.28
-helm version                     # >= 3.x
+helm version                     # >= 3.17 (fromToml, exigido pelo chart)
 ```
 
 ### 0.2. Instalar cert-manager
@@ -23,13 +28,13 @@ Exigido pelo ClickHouse Kubernetes Operator para emitir os certificados do webho
 
 ```bash
 helm install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --version v1.20.2 \
   -n cert-manager --create-namespace \
   --set crds.enabled=true
-```
 
-```bash
-# Verificar
-kubectl get pods -n cert-manager
+kubectl wait --for=condition=Established \
+  crd/certificates.cert-manager.io crd/issuers.cert-manager.io \
+  --timeout=120s
 ```
 
 ### 0.3. Instalar o ClickHouse Kubernetes Operator (CRDs + controller)
@@ -39,21 +44,21 @@ usadas pelo chart do Langfuse quando `clickhouse.deploy: true`.
 
 ```bash
 helm install clickhouse-operator oci://ghcr.io/clickhouse/clickhouse-operator-helm \
+  --version 0.0.5 \
   -n clickhouse-operator-system --create-namespace
-```
 
-```bash
-# Verificar
-kubectl get pods -n clickhouse-operator-system
-kubectl get crd | grep clickhouse.com
+kubectl wait --for=condition=Established \
+  crd/clickhouseclusters.clickhouse.com crd/keeperclusters.clickhouse.com \
+  --timeout=120s
 ```
 
 > Alternativa via `kubectl` (sem Helm), caso prefira: consulte
 > [ClickHouse Docs — Install with kubectl](https://clickhouse.com/docs/clickhouse-operator/install/kubectl).
-> Fonte consultada e validada para este procedimento: [ClickHouse Docs — Install with Helm](https://clickhouse.com/docs/products/kubernetes-operator/install/helm).
+> Fontes: [github.com/langfuse/langfuse-k8s](https://github.com/langfuse/langfuse-k8s) (README,
+> seção *Pre-installation Setup*) e [ClickHouse Docs — Install with Helm](https://clickhouse.com/docs/products/kubernetes-operator/install/helm).
 
 > ⚠️ Este passo só é necessário quando `clickhouse.deploy: true` (nosso caso, em
-> `clickhouse.yaml`). Deployments que apontam para um ClickHouse externo/gerenciado
+> `worker.yaml`). Deployments que apontam para um ClickHouse externo/gerenciado
 > (`clickhouse.deploy: false`) não precisam do operator.
 
 ### 0.4. Checklist final antes de instalar o Langfuse
@@ -66,17 +71,20 @@ kubectl get crd | grep clickhouse.com   # deve listar clickhousecluster e keeper
 
 ### 0.5. Pré-requisitos ADICIONAIS para Amazon EKS
 
-Só se aplicam quando for usar `eks.yaml` (overlay de produção — Ingress ALB, S3 real
-via IRSA, StorageClass gp3). O Kind/Docker Compose não precisam disso.
+Necessários porque `web.yaml`/`worker.yaml`/`postgres.yaml` já vêm configurados para EKS
+por padrão (Ingress ALB, S3 via IRSA, StorageClass `gp3`):
 
-- **AWS Load Balancer Controller** instalado no cluster (fornece a `IngressClassName: alb`
-  usada por `eks.yaml`)
+- **AWS Load Balancer Controller** instalado no cluster (fornece a `IngressClassName: alb`)
 - **Addon EBS CSI Driver** habilitado no cluster + **StorageClass `gp3`** criada
   (nem todo cluster EKS vem com uma por padrão)
 - **Bucket S3** real criado
 - **IAM Role (IRSA)** com permissão de leitura/escrita nesse bucket, associada à
-  Service Account do Langfuse via `eks.amazonaws.com/role-arn` — sem access
-  key/secret key fixos, autenticação por identidade do pod
+  Service Account do Langfuse via `eks.amazonaws.com/role-arn` (`web.yaml`) — sem
+  access key/secret key fixos, autenticação por identidade do pod. A policy mínima
+  (`s3:PutObject`/`s3:ListBucket`/`s3:GetObject` — confirmada na documentação oficial
+  do Langfuse, seção *Amazon S3*) está em **`eks-iam-policy.json`** (substitua
+  `<SEU_BUCKET_S3>` antes de anexar à Role). Para Data Retention, adicione também
+  `s3:DeleteObject`.
 - **Certificado ACM** emitido para o domínio público (referenciado no Ingress)
 
 ```bash
@@ -86,13 +94,9 @@ kubectl get sa -n kube-system aws-load-balancer-controller 2>&1
 kubectl get storageclass gp3
 ```
 
-Depois de gerar/editar `eks.yaml` com os valores reais (domínio, ARNs, bucket,
-região — todos marcados com `<...>` no arquivo), inclua-o **por último** em todos
-os comandos `helm template`/`install`/`upgrade` das seções 4, 5, 8 e 9 abaixo:
-
-```bash
--f values.yaml -f web.yaml -f worker.yaml -f postgres.yaml -f redis.yaml -f clickhouse.yaml -f eks.yaml
-```
+Antes de aplicar, substitua todos os placeholders `<...>` em `web.yaml` (domínio, ARNs,
+bucket, região, account ID) e `worker.yaml`/`postgres.yaml` (`className: gp3`, se seu
+cluster usar outro nome de StorageClass).
 
 ---
 
@@ -111,13 +115,20 @@ helm repo add langfuse https://langfuse.github.io/langfuse-k8s
 helm repo update
 ```
 
+> O método "canônico" atual no README oficial é via OCI
+> (`oci://ghcr.io/langfuse/langfuse-k8s/charts/langfuse`); o `helm repo add` acima é o
+> método "alternativo" documentado — ambos funcionam e continuam suportados. Usamos o
+> `helm repo add` por manter o histórico de validação deste projeto (`helm lint`/`helm
+> template` já testados extensivamente com ele).
+
 ---
 
 ## 3. Aplicar os segredos (secrets.yaml)
 
-Todas as credenciais da stack (app, Postgres, Redis/Valkey, ClickHouse, S3/MinIO e o
-bootstrap headless) vêm de um único `Secret` Kubernetes — `secrets.yaml` — referenciado
-pelos values via `existingSecret`/`secretKeyRef`. **Aplicar antes do `helm install`**:
+Todas as credenciais da stack (app, Postgres, Redis/Valkey, ClickHouse e o bootstrap
+headless) vêm de um único `Secret` Kubernetes — `secrets.yaml` — referenciado pelos
+values via `existingSecret`/`secretKeyRef`. **S3 não usa segredo nenhum** — autentica via
+IAM Role (IRSA), ver seção 0.5. **Aplicar antes do `helm install`**:
 
 ```bash
 kubectl apply -f secrets.yaml
@@ -130,42 +141,29 @@ e trate `secrets.yaml` como um arquivo sensível — **não commitar em Git com 
 reais** (adicione ao `.gitignore` fora do laboratório, ou use um secret manager externo
 + `kubectl create secret` / External Secrets Operator em vez de um YAML versionado).
 
-Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml`/`postgres.yaml`/
-`redis.yaml`/`clickhouse.yaml`/`values.yaml` são `langfuse.salt.secretKeyRef`,
-`langfuse.encryptionKey.secretKeyRef`, `langfuse.nextauth.secret.secretKeyRef`,
-`postgresql.auth.existingSecret` (+ `settings`/`userDatabase.existingSecret`),
-`redis.auth.existingSecret`/`usersExistingSecret`, `clickhouse.auth.existingSecret` e
-`s3.accessKeyId`/`secretAccessKey.secretKeyRef` — todos apontando para o Secret
-`langfuse` criado por este arquivo (não `langfuse.env.*`, que não existe no schema
-do chart).
+Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml`/`postgres.yaml` são
+`langfuse.salt.secretKeyRef`, `langfuse.encryptionKey.secretKeyRef`,
+`langfuse.nextauth.secret.secretKeyRef`, `postgresql.auth.existingSecret` (+
+`settings`/`userDatabase.existingSecret`), `redis.auth.existingSecret`/
+`usersExistingSecret` e `clickhouse.auth.existingSecret` — todos apontando para o
+Secret `langfuse` criado por este arquivo (não `langfuse.env.*`, que não existe no
+schema do chart).
 
-Para produção, ajuste também a URL pública em `langfuse.nextauth.url` (`web.yaml`/
-`worker.yaml`, default `http://localhost:3000`) — pode ser sobrescrita via
+Ajuste também a URL pública em `langfuse.nextauth.url` (`web.yaml`/`worker.yaml`,
+placeholder `<SEU_DOMINIO>`) — pode ser sobrescrita via
 `--set langfuse.nextauth.url=https://langfuse.seudominio.com` no install/upgrade sem
 editar os arquivos.
-
-**Deploy em EKS**: use `eks.yaml` (seção 0.5) em vez de editar `secrets.yaml`/`--set`
-manualmente — ele já sobrescreve `langfuse.nextauth.url`, S3 (real, via IRSA) e
-StorageClass. Para as senhas de banco/cache/ClickHouse em produção, prefira gerar
-`secrets.yaml` a partir de um secret manager (AWS Secrets Manager + External Secrets
-Operator) em vez de editar o YAML de laboratório à mão.
 
 ---
 
 ## 4. Validar o template antes de aplicar (dry-run)
 
-> Em deploy no **EKS**, adicione `-f eks.yaml` por último em todos os comandos
-> `helm` desta seção em diante (template/install/upgrade) — ver seção 0.5.
-
 ```bash
 helm template langfuse langfuse/langfuse \
   -n langfuse \
-  -f values.yaml \
   -f web.yaml \
   -f worker.yaml \
   -f postgres.yaml \
-  -f redis.yaml \
-  -f clickhouse.yaml \
   > /tmp/langfuse-rendered.yaml
 
 # Revise o manifesto renderizado antes de aplicar
@@ -178,6 +176,29 @@ less /tmp/langfuse-rendered.yaml
 > — isso simula as CRDs apenas para permitir a renderização offline. **Não** use isso no
 > `helm install` real: lá o `crdCheck: true` deve validar as CRDs de verdade no cluster.
 
+### 4.1. Testar em Kind/local (sem AWS real)
+
+Os 3 arquivos assumem EKS por padrão. Para testar num Kind local (sem ALB Controller,
+IAM Role ou StorageClass `gp3`), sobrescreva via `--set` sem editar os arquivos — por
+exemplo, apontando o S3 para um MinIO local:
+
+```bash
+--set langfuse.ingress.enabled=false \
+--set langfuse.serviceAccount.annotations=null \
+--set postgresql.storage.className="" \
+--set redis.dataStorage.className="" \
+--set clickhouse.cluster.storage.className="" \
+--set clickhouse.keeper.storage.className="" \
+--set s3.endpoint=http://minio:9000 \
+--set s3.bucket=langfuse \
+--set s3.region=us-east-1 \
+--set s3.forcePathStyle=true \
+--set s3.accessKeyId.value=minio \
+--set s3.secretAccessKey.value=miniosecret
+```
+
+(`className: ""` faz o cluster usar a StorageClass default — no Kind, `standard`.)
+
 ---
 
 ## 5. Instalar (primeira vez)
@@ -189,12 +210,9 @@ disso.
 ```bash
 helm install langfuse langfuse/langfuse \
   -n langfuse \
-  -f values.yaml \
   -f web.yaml \
   -f worker.yaml \
   -f postgres.yaml \
-  -f redis.yaml \
-  -f clickhouse.yaml \
   --wait --timeout 10m
 ```
 
@@ -299,12 +317,9 @@ inicializado com a senha antiga. Nesse caso é preciso recriar o release e os PV
 ```bash
 helm upgrade langfuse langfuse/langfuse \
   -n langfuse \
-  -f values.yaml \
   -f web.yaml \
   -f worker.yaml \
   -f postgres.yaml \
-  -f redis.yaml \
-  -f clickhouse.yaml \
   --wait --timeout 10m
 ```
 
@@ -333,13 +348,14 @@ kubectl get pvc -n langfuse
 
 ## Checklist rápido
 
-- [ ] cert-manager instalado (`helm install cert-manager oci://quay.io/jetstack/charts/cert-manager -n cert-manager --create-namespace --set crds.enabled=true`)
-- [ ] ClickHouse Kubernetes Operator instalado (`helm install clickhouse-operator oci://ghcr.io/clickhouse/clickhouse-operator-helm -n clickhouse-operator-system --create-namespace`)
+- [ ] cert-manager instalado (`helm install cert-manager oci://quay.io/jetstack/charts/cert-manager --version v1.20.2 -n cert-manager --create-namespace --set crds.enabled=true`)
+- [ ] ClickHouse Kubernetes Operator instalado (`helm install clickhouse-operator oci://ghcr.io/clickhouse/clickhouse-operator-helm --version 0.0.5 -n clickhouse-operator-system --create-namespace`)
 - [ ] `kubectl get crd | grep clickhouse.com` lista `ClickHouseCluster` e `KeeperCluster`
 - [ ] Namespace `langfuse` criado
 - [ ] Repositório Helm adicionado/atualizado
 - [ ] `secrets.yaml` aplicado (`kubectl apply -f secrets.yaml`) — com valores próprios em homolog/prod, não os de laboratório
-- [ ] `langfuse.nextauth.url` ajustado para o domínio real (produção)
+- [ ] Placeholders `<...>` substituídos em `web.yaml` (domínio, ARNs, bucket, região, account ID)
+- [ ] Pré-requisitos de EKS prontos (seção 0.5) — ou overrides de Kind aplicados (seção 4.1)
 - [ ] `helm template` revisado antes do `install`
 - [ ] Release instalado com nome exato `langfuse`
 - [ ] Pods e PVCs saudáveis (`kubectl get pods/pvc -n langfuse`)
