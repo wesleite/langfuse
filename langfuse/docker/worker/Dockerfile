@@ -1,14 +1,11 @@
-# ==============================================================================
-# Langfuse Worker
-# ------------------------------------------------------------------------------
-# Assim como o web, o worker é distribuído pela imagem oficial do projeto
-# (fonte em https://github.com/langfuse/langfuse). Imagem/tag confirmados via
-# `helm template` no chart oficial (2.1.0 / appVersion 4.24.0): registry
-# próprio docker.langfuse.com, não Docker Hub.
-# ==============================================================================
 FROM docker.langfuse.com/langfuse/langfuse-worker:4.24.0
 
-# Customizações específicas da stack (ex: CA certs internos, timezone) entram aqui.
-# Credenciais (SALT, ENCRYPTION_KEY, NEXTAUTH_SECRET, DATABASE_URL etc.) NÃO são
-# embutidas na imagem — são injetadas em runtime via o Secret "langfuse"
-# (secrets.yaml) referenciado pelo Helm chart. Ver worker.yaml e DEPLOY.md.
+USER root
+
+RUN apk update && apk upgrade --no-cache libcrypto3 libssl3 libc6-compat busybox ssl_client zlib \
+    && apk add --no-cache dumb-init curl
+
+USER expressjs
+
+ENTRYPOINT ["dumb-init", "--", "./worker/entrypoint.sh"]
+CMD ["node", "worker/dist/index.js"]

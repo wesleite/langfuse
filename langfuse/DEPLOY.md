@@ -7,9 +7,10 @@
 > (clickhouse.com/docs) para os passos do operator/cert-manager — ver seção 0.3.
 > Consulte também `README.md` para a visão geral da arquitetura, riscos e segredos.
 >
-> ⚠️ Esta stack assume **Amazon EKS** como alvo padrão (Ingress ALB, S3 via IAM Role/IRSA,
-> StorageClass `gp3` já vêm configurados em `web.yaml`/`worker.yaml`/`postgres.yaml`). Para
-> testar em **Kind/local**, veja os overrides na seção 4.1.
+> ⚠️ Esta stack assume **Amazon EKS** como alvo padrão: Ingress ALB, imagens via
+> **ECR**, S3 via **IAM Role/IRSA**, StorageClass `gp3`, e **Postgres externo (RDS)** —
+> não há Postgres bundled no cluster. Para testar em **Kind/local**, veja os overrides
+> na seção 4.1.
 
 ---
 
@@ -52,14 +53,9 @@ kubectl wait --for=condition=Established \
   --timeout=120s
 ```
 
-> Alternativa via `kubectl` (sem Helm), caso prefira: consulte
-> [ClickHouse Docs — Install with kubectl](https://clickhouse.com/docs/clickhouse-operator/install/kubectl).
-> Fontes: [github.com/langfuse/langfuse-k8s](https://github.com/langfuse/langfuse-k8s) (README,
-> seção *Pre-installation Setup*) e [ClickHouse Docs — Install with Helm](https://clickhouse.com/docs/products/kubernetes-operator/install/helm).
-
-> ⚠️ Este passo só é necessário quando `clickhouse.deploy: true` (nosso caso, em
-> `worker.yaml`). Deployments que apontam para um ClickHouse externo/gerenciado
-> (`clickhouse.deploy: false`) não precisam do operator.
+> Alternativa via `kubectl` (sem Helm): [ClickHouse Docs — Install with kubectl](https://clickhouse.com/docs/clickhouse-operator/install/kubectl).
+> Fontes: [github.com/langfuse/langfuse-k8s](https://github.com/langfuse/langfuse-k8s) (README) e
+> [ClickHouse Docs — Install with Helm](https://clickhouse.com/docs/products/kubernetes-operator/install/helm).
 
 ### 0.4. Checklist final antes de instalar o Langfuse
 
@@ -71,21 +67,30 @@ kubectl get crd | grep clickhouse.com   # deve listar clickhousecluster e keeper
 
 ### 0.5. Pré-requisitos ADICIONAIS para Amazon EKS
 
-Necessários porque `web.yaml`/`worker.yaml`/`postgres.yaml` já vêm configurados para EKS
-por padrão (Ingress ALB, S3 via IRSA, StorageClass `gp3`):
-
 - **AWS Load Balancer Controller** instalado no cluster (fornece a `IngressClassName: alb`)
 - **Addon EBS CSI Driver** habilitado no cluster + **StorageClass `gp3`** criada
-  (nem todo cluster EKS vem com uma por padrão)
+  (nem todo cluster EKS vem com uma por padrão — Redis e ClickHouse/Keeper usam)
 - **Bucket S3** real criado
 - **IAM Role (IRSA)** com permissão de leitura/escrita nesse bucket, associada à
   Service Account do Langfuse via `eks.amazonaws.com/role-arn` (`web.yaml`) — sem
-  access key/secret key fixos, autenticação por identidade do pod. A policy mínima
-  (`s3:PutObject`/`s3:ListBucket`/`s3:GetObject` — confirmada na documentação oficial
-  do Langfuse, seção *Amazon S3*) está em **`eks-iam-policy.json`** (substitua
-  `<SEU_BUCKET_S3>` antes de anexar à Role). Para Data Retention, adicione também
-  `s3:DeleteObject`.
+  access key/secret key fixos, autenticação por identidade do pod. Policy mínima
+  necessária (confirmada na documentação oficial do Langfuse, seção *Amazon S3*):
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Sid": "EventBucketAccess",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:ListBucket", "s3:GetObject"],
+      "Resource": ["arn:aws:s3:::<SEU_BUCKET_S3>", "arn:aws:s3:::<SEU_BUCKET_S3>/*"]
+    }]
+  }
+  ```
+  Para Data Retention, adicione também `s3:DeleteObject` à Action.
 - **Certificado ACM** emitido para o domínio público (referenciado no Ingress)
+- **Repositórios ECR** criados para `langfuse-web` e `langfuse-worker` (ver seção 0.6)
+- **Instância RDS PostgreSQL** provisionada, acessível a partir do cluster (mesma VPC/
+  security group liberado) — ver seção 0.7
 
 ```bash
 # Verificar
@@ -95,8 +100,53 @@ kubectl get storageclass gp3
 ```
 
 Antes de aplicar, substitua todos os placeholders `<...>` em `web.yaml` (domínio, ARNs,
-bucket, região, account ID) e `worker.yaml`/`postgres.yaml` (`className: gp3`, se seu
-cluster usar outro nome de StorageClass).
+bucket, região, account ID, repo ECR) e `worker.yaml` (repo ECR, `className: gp3`, se
+seu cluster usar outro nome de StorageClass).
+
+### 0.6. Build e push das imagens para o ECR
+
+Este repositório não contém o código-fonte do Langfuse — as imagens usadas são as
+oficiais (`docker.langfuse.com/langfuse/langfuse(-worker):4.24.0`), com os Dockerfiles
+em `docker/web/` e `docker/worker/` servindo de base para customização (certs, health
+check) antes do push para o seu ECR:
+
+```bash
+aws ecr create-repository --repository-name langfuse-web --region <SUA_REGIAO_AWS>
+aws ecr create-repository --repository-name langfuse-worker --region <SUA_REGIAO_AWS>
+
+aws ecr get-login-password --region <SUA_REGIAO_AWS> | \
+  docker login --username AWS --password-stdin <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com
+
+docker build -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web:4.24.0 \
+  -f docker/web/Dockerfile docker/web
+docker push <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web:4.24.0
+
+docker build -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker:4.24.0 \
+  -f docker/worker/Dockerfile docker/worker
+docker push <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker:4.24.0
+```
+
+`web.yaml`/`worker.yaml` já apontam `langfuse.web.image.repository`/
+`langfuse.worker.image.repository` para esse padrão de URI — só trocar
+`<SEU_ACCOUNT_ID>`/`<SUA_REGIAO_AWS>`.
+
+### 0.7. Postgres externo (RDS) — sem Postgres bundled
+
+Esta stack **não** implanta Postgres dentro do cluster (`postgresql.deploy: false` em
+`web.yaml`). A conexão inteira vem de uma única variável, `DATABASE_URL`, injetada via
+`langfuse.additionalEnv` a partir de `secrets.yaml`:
+
+```yaml
+DATABASE_URL: "postgresql://usuario:senha@seu-rds.cluster-xxxx.regiao.rds.amazonaws.com:5432/langfuse"
+```
+
+⚠️ **Não defina** `postgresql.host`/`postgresql.auth.*` (config estruturada) em nenhum
+arquivo — o chart valida que você não misture `additionalEnv` com a config estruturada
+do Postgres, e `helm template` falha se os dois estiverem presentes ao mesmo tempo.
+
+Garanta que o banco `langfuse` já exista no RDS (ou que o usuário na connection string
+tenha permissão para criá-lo) — as migrações do Prisma rodam automaticamente no
+startup do `web` contra essa URL.
 
 ---
 
@@ -117,42 +167,42 @@ helm repo update
 
 > O método "canônico" atual no README oficial é via OCI
 > (`oci://ghcr.io/langfuse/langfuse-k8s/charts/langfuse`); o `helm repo add` acima é o
-> método "alternativo" documentado — ambos funcionam e continuam suportados. Usamos o
-> `helm repo add` por manter o histórico de validação deste projeto (`helm lint`/`helm
-> template` já testados extensivamente com ele).
+> método "alternativo" documentado — ambos funcionam. Usamos o `helm repo add` por
+> manter o histórico de validação deste projeto (`helm lint`/`helm template` testados
+> extensivamente com ele).
 
 ---
 
 ## 3. Aplicar os segredos (secrets.yaml)
 
-Todas as credenciais da stack (app, Postgres, Redis/Valkey, ClickHouse e o bootstrap
-headless) vêm de um único `Secret` Kubernetes — `secrets.yaml` — referenciado pelos
-values via `existingSecret`/`secretKeyRef`. **S3 não usa segredo nenhum** — autentica via
-IAM Role (IRSA), ver seção 0.5. **Aplicar antes do `helm install`**:
+Todas as credenciais da stack (app, Postgres externo, Redis/Valkey, ClickHouse e o
+bootstrap headless) vêm de um único `Secret` Kubernetes — **`secrets.yaml`, nome
+`langfuse-secrets`** — referenciado pelos values via `existingSecret`/`secretKeyRef`.
+**S3 não usa segredo nenhum** — autentica via IAM Role (IRSA), ver seção 0.5.
+**Aplicar antes do `helm install`**:
 
 ```bash
 kubectl apply -f secrets.yaml
 ```
 
 ⚠️ **Valores de laboratório** — o arquivo já vem preenchido com senhas fixas para uso
-local. **Nunca reutilizar em produção**: gere valores únicos (`openssl rand -hex 32`
-para `encryption-key`/senhas, `openssl rand -base64 32` para `salt`/`nextauth-secret`)
-e trate `secrets.yaml` como um arquivo sensível — **não commitar em Git com valores
-reais** (adicione ao `.gitignore` fora do laboratório, ou use um secret manager externo
-+ `kubectl create secret` / External Secrets Operator em vez de um YAML versionado).
+local (exceto `DATABASE_URL`, que já precisa ser um RDS real ou outro Postgres externo
+acessível). **Nunca reutilizar em produção**: gere valores únicos (`openssl rand -hex 32`
+para `encryption-key`, `openssl rand -base64 32` para `salt`/`nextauth-secret`) e trate
+`secrets.yaml` como um arquivo sensível — **não commitar em Git com valores reais**
+(adicione ao `.gitignore` fora do laboratório, ou use um secret manager externo +
+`kubectl create secret` / External Secrets Operator em vez de um YAML versionado).
 
-Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml`/`postgres.yaml` são
+Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml` são
 `langfuse.salt.secretKeyRef`, `langfuse.encryptionKey.secretKeyRef`,
-`langfuse.nextauth.secret.secretKeyRef`, `postgresql.auth.existingSecret` (+
-`settings`/`userDatabase.existingSecret`), `redis.auth.existingSecret`/
+`langfuse.nextauth.secret.secretKeyRef`, `langfuse.additionalEnv[].valueFrom.secretKeyRef`
+(para `DATABASE_URL` e os `LANGFUSE_INIT_*`), `redis.auth.existingSecret`/
 `usersExistingSecret` e `clickhouse.auth.existingSecret` — todos apontando para o
-Secret `langfuse` criado por este arquivo (não `langfuse.env.*`, que não existe no
-schema do chart).
+Secret **`langfuse-secrets`** (não `langfuse.env.*`, que não existe no schema do chart,
+nem um nome de Secret diferente em qualquer arquivo — isso quebra o deploy).
 
-Ajuste também a URL pública em `langfuse.nextauth.url` (`web.yaml`/`worker.yaml`,
-placeholder `<SEU_DOMINIO>`) — pode ser sobrescrita via
-`--set langfuse.nextauth.url=https://langfuse.seudominio.com` no install/upgrade sem
-editar os arquivos.
+Ajuste também a URL pública em `langfuse.nextauth.url` (`web.yaml`/`worker.yaml`) para
+o domínio real antes de aplicar em produção.
 
 ---
 
@@ -163,7 +213,6 @@ helm template langfuse langfuse/langfuse \
   -n langfuse \
   -f web.yaml \
   -f worker.yaml \
-  -f postgres.yaml \
   > /tmp/langfuse-rendered.yaml
 
 # Revise o manifesto renderizado antes de aplicar
@@ -178,14 +227,17 @@ less /tmp/langfuse-rendered.yaml
 
 ### 4.1. Testar em Kind/local (sem AWS real)
 
-Os 3 arquivos assumem EKS por padrão. Para testar num Kind local (sem ALB Controller,
-IAM Role ou StorageClass `gp3`), sobrescreva via `--set` sem editar os arquivos — por
-exemplo, apontando o S3 para um MinIO local:
+Os arquivos assumem EKS + RDS externo por padrão. Para testar num Kind local (sem ALB
+Controller, IAM Role, StorageClass `gp3`, ECR ou RDS), sobrescreva via `--set` sem
+editar os arquivos — por exemplo, com um Postgres e S3 (MinIO) locais:
 
 ```bash
 --set langfuse.ingress.enabled=false \
 --set langfuse.serviceAccount.annotations=null \
---set postgresql.storage.className="" \
+--set langfuse.web.image.repository=docker.langfuse.com/langfuse/langfuse \
+--set langfuse.web.image.tag=4.24.0 \
+--set langfuse.worker.image.repository=docker.langfuse.com/langfuse/langfuse-worker \
+--set langfuse.worker.image.tag=4.24.0 \
 --set redis.dataStorage.className="" \
 --set clickhouse.cluster.storage.className="" \
 --set clickhouse.keeper.storage.className="" \
@@ -197,6 +249,10 @@ exemplo, apontando o S3 para um MinIO local:
 --set s3.secretAccessKey.value=miniosecret
 ```
 
+⚠️ Como não há mais Postgres bundled nesta stack, testar no Kind exige um Postgres
+real acessível (ex: `docker run postgres:18` na mesma rede, ou reaproveitar o
+`docker-compose/` para só o banco) — aponte `DATABASE_URL` em `secrets.yaml` para ele.
+
 (`className: ""` faz o cluster usar a StorageClass default — no Kind, `standard`.)
 
 ---
@@ -204,21 +260,18 @@ exemplo, apontando o S3 para um MinIO local:
 ## 5. Instalar (primeira vez)
 
 ⚠️ O release **precisa se chamar `langfuse`** — os hostnames internos
-(`langfuse-postgresql`, `langfuse-redis`, `langfuse-clickhouse-headless`) dependem
-disso.
+(`langfuse-redis`, `langfuse-clickhouse-headless`) dependem disso.
 
 ```bash
 helm install langfuse langfuse/langfuse \
   -n langfuse \
   -f web.yaml \
   -f worker.yaml \
-  -f postgres.yaml \
   --wait --timeout 10m
 ```
 
 > Durante o deploy, os pods `langfuse-web` e `langfuse-worker` podem reiniciar
-> algumas vezes enquanto Postgres/ClickHouse ainda estão sendo provisionados —
-> isso é esperado (comportamento documentado oficialmente).
+> algumas vezes enquanto o RDS/ClickHouse ainda não respondem — isso é esperado.
 
 ---
 
@@ -230,8 +283,8 @@ kubectl get pvc -n langfuse
 kubectl logs -n langfuse deploy/langfuse-web --tail=100 -f
 ```
 
-Resultado esperado: todos os pods (`web`, `worker`, `postgresql`, `redis`/valkey,
-`clickhouse`, `clickhouse-keeper-0/1/2`) em `Running` e `READY`.
+Resultado esperado: todos os pods (`web`, `worker`, `redis`/valkey, `clickhouse`,
+`clickhouse-keeper-0/1/2`) em `Running` e `READY`. Sem pod de Postgres (externo/RDS).
 
 ---
 
@@ -250,10 +303,6 @@ organização, o projeto e o usuário já foram criados automaticamente no prime
 
 ### Via scripts de teste do SDK
 
-Como o bootstrap headless já cria um par de API keys fixo (`LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/
-`LANGFUSE_INIT_PROJECT_SECRET_KEY` em `secrets.yaml`), os scripts podem rodar sem
-nenhum passo manual na UI:
-
 ```bash
 cd tests
 pip install langfuse python-dotenv
@@ -269,19 +318,12 @@ python teste-langfuse.py
 python teste-otel.py
 ```
 
-> As chaves acima vêm direto de `secrets.yaml` — use sempre o valor atual do arquivo,
-> não copie chaves de exemplos antigos (ver seção 8 sobre o gotcha de chaves
-> acumuladas quando `secrets.yaml` é atualizado).
-
 Resultado esperado: mensagens de sucesso no console e traces visíveis na UI do
 Langfuse (`http://localhost:3000` → seção *Traces*).
 
 ---
 
 ## 8. Atualizar segredos (secrets.yaml) após o deploy inicial
-
-Para trocar qualquer valor de `secrets.yaml` (senha, chave, ou as variáveis de
-bootstrap `LANGFUSE_INIT_*`) numa stack já rodando:
 
 ```bash
 kubectl apply -f secrets.yaml
@@ -294,21 +336,11 @@ novo depois de recriados (`rollout restart`).
 ⚠️ **Gotcha do bootstrap headless**: ele só *cria* recursos que não existem — não
 *atualiza* os existentes. Se você mudar `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/
 `_SECRET_KEY` mantendo o mesmo `LANGFUSE_INIT_PROJECT_ID`, o Langfuse cria uma **API
-key adicional** para o projeto; a chave antiga continua ativa (validei consultando a
-tabela `api_keys` no Postgres). Para revogar a antiga, use a UI (Project Settings →
-API Keys) ou a API — não é uma troca automática.
+key adicional** para o projeto; a chave antiga continua ativa. Para revogar a antiga,
+use a UI (Project Settings → API Keys) ou a API.
 
-> Apenas variáveis **realmente lidas pela aplicação** têm efeito ao reiniciar os
-> pods — ver a lista oficial de `LANGFUSE_INIT_*` no `README.md`, seção 5. Uma chave
-> inventada em `secrets.yaml` (ex: `LANGFUSE_INIT_BASE_URL`, que não existe) fica
-> parada no Secret sem nenhum efeito, a menos que também seja referenciada em
-> `langfuse.additionalEnv` (`web.yaml`/`worker.yaml`) — e mesmo assim só funcionaria
-> se fosse uma env var real da aplicação.
-
-Se as credenciais de **Postgres/Redis/ClickHouse** mudarem (não apenas os segredos da
-app/bootstrap), o `rollout restart` sozinho não é suficiente — o banco já foi
-inicializado com a senha antiga. Nesse caso é preciso recriar o release e os PVCs
-(ver seção 11).
+Se `DATABASE_URL` mudar para apontar a outro RDS, o `rollout restart` é suficiente
+(não há Postgres bundled para recriar).
 
 ---
 
@@ -319,7 +351,6 @@ helm upgrade langfuse langfuse/langfuse \
   -n langfuse \
   -f web.yaml \
   -f worker.yaml \
-  -f postgres.yaml \
   --wait --timeout 10m
 ```
 
@@ -341,8 +372,10 @@ helm uninstall langfuse -n langfuse
 
 # PVCs não são removidos automaticamente pelo Helm — decisão explícita:
 kubectl get pvc -n langfuse
-# kubectl delete pvc -n langfuse --all   # ⚠️ destrutivo: apaga dados do Postgres/ClickHouse
+# kubectl delete pvc -n langfuse --all   # ⚠️ destrutivo: apaga dados do Redis/ClickHouse
 ```
+
+O RDS (externo) não é afetado pelo `helm uninstall` — gerenciado fora do Helm.
 
 ---
 
@@ -353,10 +386,12 @@ kubectl get pvc -n langfuse
 - [ ] `kubectl get crd | grep clickhouse.com` lista `ClickHouseCluster` e `KeeperCluster`
 - [ ] Namespace `langfuse` criado
 - [ ] Repositório Helm adicionado/atualizado
+- [ ] Repositórios ECR criados e imagens (web/worker) buildadas e enviadas (seção 0.6)
+- [ ] Instância RDS provisionada e acessível; `DATABASE_URL` em `secrets.yaml` aponta pra ela
 - [ ] `secrets.yaml` aplicado (`kubectl apply -f secrets.yaml`) — com valores próprios em homolog/prod, não os de laboratório
-- [ ] Placeholders `<...>` substituídos em `web.yaml` (domínio, ARNs, bucket, região, account ID)
+- [ ] Placeholders `<...>` substituídos em `web.yaml`/`worker.yaml` (domínio, ARNs, bucket, região, account ID, repo ECR)
 - [ ] Pré-requisitos de EKS prontos (seção 0.5) — ou overrides de Kind aplicados (seção 4.1)
 - [ ] `helm template` revisado antes do `install`
 - [ ] Release instalado com nome exato `langfuse`
-- [ ] Pods e PVCs saudáveis (`kubectl get pods/pvc -n langfuse`)
+- [ ] Pods e PVCs saudáveis (`kubectl get pods/pvc -n langfuse`) — sem pod de Postgres
 - [ ] Scripts em `tests/` executados com sucesso
