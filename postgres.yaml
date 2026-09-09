@@ -1,17 +1,21 @@
 # ==============================================================================
 # Configurações do PostgreSQL
 # ------------------------------------------------------------------------------
-# Credenciais vêm do Secret "langfuse" (secrets.yaml). A app conecta como
-# superusuário "postgres"/db "postgres" — ver comentário em secrets.yaml sobre
-# por que não usamos um usuário dedicado "langfuse" (CREATEDB necessário para
-# `prisma migrate` no startup do web).
+# Reconstruído a partir do exemplo oficial minimal-installation
+# (github.com/langfuse/langfuse-k8s/tree/main/examples/minimal-installation):
+# usuário/banco DEDICADOS "langfuse" (default do chart — não sobrescrevemos
+# auth.username/auth.database), não o superusuário "postgres". Isso corrige
+# uma suposição anterior deste projeto de que seria necessário usar o
+# superusuário por causa de CREATEDB — o exemplo oficial não faz essa
+# ressalva e usa o usuário dedicado normalmente.
 #
-# Duas referências distintas ao mesmo Secret são necessárias:
+# Duas referências distintas ao mesmo Secret são necessárias (mesmo padrão do
+# secret.yaml oficial):
 #  - auth.existingSecret + secretKeys: credenciais que a app (web/worker) usa
-#    para montar a DATABASE_URL.
+#    para montar a DATABASE_URL (usuário "langfuse").
 #  - settings.existingSecret / userDatabase.existingSecret: credenciais que o
-#    próprio subchart do Postgres usa para inicializar o container (senão ele
-#    tenta usar o Secret padrão "langfuse-postgresql-auth", que não existe).
+#    próprio subchart do Postgres usa para inicializar o container (superuser
+#    "postgres" + criação do usuário/banco "langfuse").
 # ==============================================================================
 postgresql:
   deploy: true
@@ -19,8 +23,6 @@ postgresql:
   port: 5432
 
   auth:
-    username: postgres
-    database: postgres
     existingSecret: langfuse
     secretKeys:
       userPasswordKey: postgresql-password
@@ -42,3 +44,4 @@ postgresql:
 
   storage:
     requestedSize: 2Gi
+    className: gp3 # EBS no EKS — remova/deixe "" no Kind (usa "standard")

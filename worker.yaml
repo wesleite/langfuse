@@ -1,10 +1,23 @@
 # ==============================================================================
-# Configurações do Langfuse - Worker
+# Configurações do Langfuse - Worker + Redis/Valkey + ClickHouse (pipeline de ingestão)
 # ------------------------------------------------------------------------------
+# Fontes oficiais:
+#   - https://github.com/langfuse/langfuse-k8s (README)
+#   - https://github.com/langfuse/langfuse-k8s/blob/main/charts/langfuse/values.yaml
+#   - https://github.com/langfuse/langfuse-k8s/tree/main/examples/minimal-installation
+#
 # Duplica os mesmos segredos/env de web.yaml (salt/encryptionKey/nextauth/
-# additionalEnv) para que este arquivo seja autossuficiente — ver secrets.yaml
-# e DEPLOY.md. Correção: `langfuse.replicaCount`/`langfuse.env` não existem no
-# schema real do chart; usar `langfuse.worker.replicas`.
+# additionalEnv) para que este arquivo seja autossuficiente. Redis (fila de
+# ingestão) e ClickHouse (destino dos eventos processados) ficam aqui — é o
+# worker quem consome a fila e escreve nesses dois — embora web também os
+# leia/use; como o Helm faz merge por chave top-level, não importa em qual -f
+# cada bloco está, o resultado final é idêntico.
+#
+# Correção: `langfuse.replicaCount`/`langfuse.env` não existem no schema real
+# do chart; usar `langfuse.worker.replicas`.
+#
+# TROQUE `redis.dataStorage.className`/`clickhouse.*.storage.className` para
+# "" (ou remova) se seu cluster não tiver uma StorageClass "gp3" (ex: Kind).
 # ==============================================================================
 langfuse:
   salt:
@@ -15,6 +28,8 @@ langfuse:
     secretKeyRef:
       name: langfuse
       key: encryption-key
+  # Default seguro (URL válida) — ver comentário em web.yaml. Para produção,
+  # troque via --set langfuse.nextauth.url=https://seu-dominio-real.com.
   nextauth:
     url: "http://localhost:3000"
     secret:
@@ -79,3 +94,62 @@ langfuse:
       limits:
         cpu: "1000m"
         memory: "1Gi"
+
+# ------------------------------------------------------------------------------
+# Redis/Valkey — fila de ingestão consumida pelo worker.
+# ------------------------------------------------------------------------------
+redis:
+  deploy: true
+  host: "langfuse-redis"
+  port: 6379
+  auth:
+    enabled: true
+    username: "default"
+    existingSecret: langfuse
+    existingSecretPasswordKey: redis-password
+    # Secret com 1 chave por usuário ACL (chave == username), consumido
+    # diretamente pelo subchart valkey-io/valkey — ver secrets.yaml.
+    usersExistingSecret: langfuse
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  dataStorage:
+    className: gp3 # EBS no EKS — remova/deixe "" no Kind (usa "standard")
+
+# ------------------------------------------------------------------------------
+# ClickHouse + Keeper — destino dos eventos processados pelo worker.
+# ------------------------------------------------------------------------------
+clickhouse:
+  deploy: true
+  host: "langfuse-clickhouse-headless"
+  httpPort: 8123
+  nativePort: 9000
+  database: default
+  crdCheck: true
+  auth:
+    username: default
+    existingSecret: langfuse
+    existingSecretKey: clickhouse-password
+  cluster:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1.5Gi"
+    storage:
+      size: 3Gi
+      className: gp3 # EBS no EKS — remova/deixe "" no Kind
+  keeper:
+    enabled: true
+    replicas: 3
+    storage:
+      size: 3Gi
+      className: gp3 # EBS no EKS — remova/deixe "" no Kind
