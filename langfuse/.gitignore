@@ -1,0 +1,3 @@
+# Segredos — nunca versionar, mesmo valores de laboratório (ver README.md, seção 5)
+secrets.yaml
+tests/.env
