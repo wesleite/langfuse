@@ -101,6 +101,20 @@ langfuse:
         cpu: "1"
         memory: "2Gi"
 
+  worker:
+    replicas: 2
+    image:
+      repository: "<SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker"
+      tag: "4.24.0"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
+
 postgresql:
   deploy: false
 
@@ -114,3 +128,54 @@ s3:
   region: "us-east-1"
   endpoint: ""
   forcePathStyle: false
+
+redis:
+  deploy: true
+  host: "langfuse-redis"
+  port: 6379
+  auth:
+    enabled: true
+    username: "default"
+    existingSecret: langfuse-secrets
+    existingSecretPasswordKey: redis-password
+    usersExistingSecret: langfuse-secrets
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  dataStorage:
+    className: gp3
+
+clickhouse:
+  deploy: true
+  host: "langfuse-clickhouse-headless"
+  httpPort: 8123
+  nativePort: 9000
+  database: default
+  crdCheck: true
+  auth:
+    username: default
+    existingSecret: langfuse-secrets
+    existingSecretKey: clickhouse-password
+  cluster:
+    enabled: true
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1.5Gi"
+    storage:
+      size: 3Gi
+      className: gp3
+  keeper:
+    enabled: true
+    replicas: 3
+    storage:
+      size: 3Gi
+      className: gp3

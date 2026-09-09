@@ -38,6 +38,8 @@ flowchart TB
 
     RDS[("PostgreSQL externo<br/>(Amazon RDS)")]
     S3[("S3 real (AWS)<br/>eventos e mídia<br/>auth via IAM Role/IRSA")]
+    SSM[("Parameter Store<br/>segredos (SecureString)")]
+    ESO["External Secrets Operator<br/>(IRSA própria)"]
 
     U -->|HTTPS via ALB Ingress| WEB
     WEB --> RDS
@@ -49,6 +51,10 @@ flowchart TB
     WORKER --> CH
     WORKER --> S3
     CH -.coordenação.-> KEEPER
+    ESO -->|lê e sincroniza| SSM
+    ESO -->|cria/atualiza| SECRET[("Secret langfuse-secrets")]
+    SECRET --> WEB
+    SECRET --> WORKER
 ```
 
 ---
@@ -57,35 +63,31 @@ flowchart TB
 
 | Serviço | Papel | Imagem | Arquivo de values | Réplicas | Persistência |
 |---|---|---|---|---|---|
-| **web** | App Next.js (UI + API) do Langfuse | `<ECR>/langfuse-web:4.24.0` (build próprio via `docker/web/Dockerfile`, FROM `docker.langfuse.com/langfuse/langfuse:4.24.0`) | `web.yaml` | 2 | — |
-| **worker** | Processamento assíncrono (ingestão, batch export) | `<ECR>/langfuse-worker:4.24.0` (via `docker/worker/Dockerfile`) | `worker.yaml` | 2 | — |
-| **postgresql** | Metadados, usuários, projetos, configuração | **Externo — Amazon RDS**, não gerenciado por este chart | `web.yaml`/`worker.yaml` (`DATABASE_URL` via `additionalEnv`) | — (gerenciado fora do Helm) | — |
-| **redis** (Valkey) | Fila de ingestão consumida pelo worker + cache | `docker.io/valkey/valkey:8.0` (subchart `valkey-io/valkey`) | `worker.yaml` | 1 (standalone) | 8Gi (default do chart) |
-| **clickhouse** | Armazenamento analítico de traces/observações (sink do worker) | `clickhouse/clickhouse-server:26.4` (CR `ClickHouseCluster` via ClickHouse Operator) | `worker.yaml` | 1 (cluster habilitado) | 3Gi |
-| **clickhouse-keeper** | Coordenação/consenso do cluster ClickHouse | `clickhouse/clickhouse-keeper:26.4` (CR `KeeperCluster`) | `worker.yaml` | 3 | 3Gi cada |
-| **s3** | Armazenamento de objetos (eventos, mídia, exports) — usado por web e worker | S3 real, auth via IAM Role/IRSA (`s3.deploy: false`) | `web.yaml` | — | — |
+| **web** | App Next.js (UI + API) do Langfuse | `<ECR>/langfuse-web:4.24.0` (build próprio via `docker/Dockerfile --target web`, FROM `docker.langfuse.com/langfuse/langfuse:4.24.0`) | `values.yaml` | 2 | — |
+| **worker** | Processamento assíncrono (ingestão, batch export) | `<ECR>/langfuse-worker:4.24.0` (via `docker/Dockerfile --target worker`) | `values.yaml` | 2 | — |
+| **postgresql** | Metadados, usuários, projetos, configuração | **Externo — Amazon RDS**, não gerenciado por este chart | `values.yaml` (`DATABASE_URL` via `additionalEnv`) | — (gerenciado fora do Helm) | — |
+| **redis** (Valkey) | Fila de ingestão consumida pelo worker + cache | `docker.io/valkey/valkey:8.0` (subchart `valkey-io/valkey`) | `values.yaml` | 1 (standalone) | 8Gi (default do chart) |
+| **clickhouse** | Armazenamento analítico de traces/observações (sink do worker) | `clickhouse/clickhouse-server:26.4` (CR `ClickHouseCluster` via ClickHouse Operator) | `values.yaml` | 1 (cluster habilitado) | 3Gi |
+| **clickhouse-keeper** | Coordenação/consenso do cluster ClickHouse | `clickhouse/clickhouse-keeper:26.4` (CR `KeeperCluster`) | `values.yaml` | 3 | 3Gi cada |
+| **s3** | Armazenamento de objetos (eventos, mídia, exports) — usado por web e worker | S3 real, auth via IAM Role/IRSA (`s3.deploy: false`) | `values.yaml` | — | — |
+| **external-secrets** | Sincroniza segredos do Parameter Store para o Secret `langfuse-secrets` (homolog/prod) | `external-secrets/external-secrets` (Helm, instalado à parte, namespace próprio) | `external-secrets/*.yaml` | 1 (operator) | — |
 
 Todas as credenciais (exceto Postgres, que é externo com `DATABASE_URL` completo, e S3,
-que usa IAM Role) vêm de **um único arquivo, `secrets.yaml`** (um `Secret` Kubernetes
-chamado **`langfuse-secrets`**, no namespace `langfuse`) — ver seção 5.
+que usa IAM Role) vêm de **um único `Secret` Kubernetes chamado `langfuse-secrets`**,
+no namespace `langfuse` — em homolog/prod, criado e sincronizado pelo **External
+Secrets Operator a partir do AWS Parameter Store** (`external-secrets/*.yaml`); em
+Kind/lab, aplicado estaticamente via `secrets.local.yaml` — ver seção 5.
 
-**Só 2 arquivos de values** (`web.yaml`, `worker.yaml`) + `secrets.yaml` — sem
-`values.yaml`/`eks.yaml`/`postgres.yaml` genéricos. Cada bloco de configuração vive no
-arquivo do serviço mais associado a ele:
+**Um único arquivo de values do chart, `values.yaml`** — todas as chaves top-level do
+schema (`langfuse`, `postgresql`, `seaweedfs`, `s3`, `redis`, `clickhouse`) num só
+lugar, mais os manifests de `external-secrets/` à parte (não são values do chart, são
+CRDs do ESO aplicados antes do `helm install`). Sem `eks.yaml`/`postgres.yaml`
+genéricos. Dentro de `langfuse:` ficam: app (salt/encryptionKey/nextauth/bootstrap
+headless/`DATABASE_URL`), Ingress (ALB), ServiceAccount (IRSA), a imagem do web
+(`langfuse.web.image`) e a do worker (`langfuse.worker.image`); `redis`/`clickhouse`
+cobrem a fila de ingestão e o sink analítico consumidos pelo worker.
 
-- **`web.yaml`**: tudo "voltado pra fora" — app (salt/encryptionKey/nextauth/bootstrap
-  headless/`DATABASE_URL`), Ingress (ALB), ServiceAccount (IRSA), S3 e a própria imagem
-  do web (`langfuse.web.image`).
-- **`worker.yaml`**: o pipeline de ingestão que o worker processa — Redis (fila
-  consumida pelo worker), ClickHouse (destino dos eventos) e a imagem do worker
-  (`langfuse.worker.image`), além do app duplicado (mesmo padrão de auto-suficiência).
-
-Como o Helm faz merge por chave top-level (`langfuse`, `redis`, `clickhouse`, `s3`),
-**não importa em qual arquivo `-f` cada chave está** — o resultado final é idêntico
-independente de onde a configuração foi colocada. Essa distribuição é uma escolha de
-organização/legibilidade, não uma exigência técnica.
-
-⚠️ **Cuidado com chaves top-level erradas**: uma versão anterior destes arquivos usava
+⚠️ **Cuidado com chaves top-level erradas**: uma versão anterior deste arquivo usava
 blocos `web:`/`worker:`/`postgresql: {enabled: false}` no **topo** do YAML — essas
 chaves **não existem no schema do chart** e eram silenciosamente ignoradas (Helm não
 falha em chave desconhecida). A config real fica em `langfuse.web.*`/
@@ -93,11 +95,19 @@ falha em chave desconhecida). A config real fica em `langfuse.web.*`/
 `postgresql.deploy` (não `enabled`). Ver seção 9 para o registro completo dos bugs
 encontrados e corrigidos.
 
-Os Dockerfiles em `docker/web/Dockerfile` e `docker/worker/Dockerfile` **fazem `FROM`
-das imagens oficiais** (`docker.langfuse.com/langfuse/langfuse(-worker):4.24.0`) e
-servem de base para build/push no seu próprio ECR — ver `DEPLOY.md`, seção 0.6.
+> Um arquivo único (`values.yaml`) em vez do `web.yaml`/`worker.yaml` separados usado
+> anteriormente: o Helm faz merge por chave top-level de qualquer forma, então dividir
+> em múltiplos arquivos `-f` só duplicava blocos (`salt`/`encryptionKey`/`nextauth`/
+> `additionalEnv` apareciam idênticos nos dois) sem nenhum ganho funcional — `helm
+> template` com `values.yaml` produz exatamente o mesmo manifesto renderizado
+> (validado byte a byte, ver seção 9).
+
+Um único `docker/Dockerfile` (multi-stage, stages `web` e `worker`) **faz `FROM`
+das imagens oficiais** (`docker.langfuse.com/langfuse/langfuse(-worker):4.24.0`) em
+cada stage e serve de base para build/push no seu próprio ECR — `docker build
+--target web|worker -f docker/Dockerfile docker`, ver `DEPLOY.md`, seção 0.6.
 Confirmado via `docker inspect` ao vivo: ambas as imagens são **Alpine** (não
-Debian/Ubuntu); os Dockerfiles usam `apk`, não `apt-get`.
+Debian/Ubuntu); o Dockerfile usa `apk`, não `apt-get`.
 
 ---
 
@@ -115,12 +125,13 @@ seção 0.
 
 ### Amazon EKS (alvo padrão desta stack)
 
-`web.yaml`/`worker.yaml` já vêm configurados para EKS por padrão: Ingress via **AWS
+`values.yaml` já vem configurado para EKS por padrão: Ingress via **AWS
 Load Balancer Controller** (ALB), imagens via **ECR**, S3 real via **IAM Role (IRSA)**
 — sem access key/secret key fixos —, StorageClass `gp3` (EBS) para Redis/ClickHouse/
-Keeper, e **Postgres externo (RDS)**. Pré-requisitos adicionais, comandos de build/push
-para o ECR e a policy IAM mínima para a Role IRSA em **[DEPLOY.md](./DEPLOY.md)**,
-seções 0.5–0.7.
+Keeper, segredos via **External Secrets Operator + AWS Parameter Store** (IRSA própria,
+separada da de S3), e **Postgres externo (RDS)**. Pré-requisitos adicionais, comandos de
+build/push para o ECR, a policy IAM mínima para as Roles IRSA (S3 e Parameter Store) e
+o passo a passo do ESO em **[DEPLOY.md](./DEPLOY.md)**, seções 0.5–0.7.1.
 
 ### Testando em Kind/local (sem AWS real)
 
@@ -135,7 +146,7 @@ provisionar recursos AWS reais/pagos só para testar localmente.
 `docker-compose/` contém uma stack equivalente baseada no `docker-compose.yml` oficial
 do Langfuse v4 (confirmado via Context7), com **Postgres e MinIO locais** (não RDS/IAM
 Role — Compose não tem identidade de pod nem gerencia RDS), adaptada com os mesmos
-valores de laboratório de `secrets.yaml`:
+valores de laboratório de `secrets.local.yaml`:
 
 ```bash
 cd docker-compose
@@ -151,7 +162,7 @@ Diferenças em relação ao deploy K8s (Kind/EKS):
 | ClickHouse | Cluster + 3 Keepers via Operator | Container único, `CLICKHOUSE_CLUSTER_ENABLED: false` (sem Keeper) |
 | Redis/Valkey | ACL via Secret montado como volume | Senha via `--requirepass` |
 | S3 | Real (IAM Role) | MinIO local |
-| Segredos | `secrets.yaml` (K8s `Secret` "langfuse-secrets") | `docker-compose/.env` (nunca commitado) |
+| Segredos | Parameter Store via ESO (homolog/prod) ou `secrets.local.yaml` (Kind) — sempre Secret "langfuse-secrets" | `docker-compose/.env` (nunca commitado) |
 | Bootstrap headless | `langfuse.additionalEnv` no chart | Env vars diretas no `docker-compose.yml` |
 
 ⚠️ **Gotcha do Postgres 18+**: a imagem oficial `postgres:18` exige que `PGDATA` fique
@@ -165,34 +176,51 @@ docker compose down -v       # para e apaga os volumes (reset completo)
 
 ---
 
-## 5. Segredos (secrets.yaml)
+## 5. Segredos (Parameter Store + External Secrets Operator)
 
 Todas as credenciais da stack — app (salt/encryption-key/nextauth-secret), Postgres
 externo (`DATABASE_URL` completo), Redis/Valkey, ClickHouse e o bootstrap headless
-(org/projeto/usuário/API key automáticos) — ficam em **um único arquivo,
-`secrets.yaml`**: um manifesto `Secret` Kubernetes (`kind: Secret`, nome
-**`langfuse-secrets`**, namespace `langfuse`) aplicado com `kubectl apply -f
-secrets.yaml` **antes** do `helm install`/`upgrade` (ver `DEPLOY.md`, seção 3). Nenhum
-values file contém senha em texto claro — todos referenciam esse Secret via
-`existingSecret`/`secretKeyRef`.
+(org/projeto/usuário/API key automáticos) — ficam em **um único `Secret` Kubernetes,
+nome `langfuse-secrets`**, namespace `langfuse`. Nenhum values file contém senha em
+texto claro — todos referenciam esse Secret via `existingSecret`/`secretKeyRef`. **Como
+esse Secret é populado depende do ambiente** (confirmado via Context7,
+`/websites/external-secrets_io`):
+
+- **Homolog/prod**: o **External Secrets Operator** cria e sincroniza o Secret a
+  partir do **AWS Systems Manager Parameter Store** (`SecureString`) — manifests em
+  `external-secrets/` (`service-account.yaml`, `secret-store.yaml`,
+  `external-secret.yaml`), aplicados **antes** do `helm install`/`upgrade` (ver
+  `DEPLOY.md`, seções 0.7 e 3). Autenticação via **IRSA dedicada** (role separada da
+  de S3), least-privilege (`ssm:GetParameter*` + `kms:Decrypt` restritos a
+  `/langfuse/<AMBIENTE>/*`) — sem access key/secret key fixos.
+- **Kind/lab**: `secrets.local.yaml`, um `Secret` estático com valores fixos de
+  laboratório — **não versionado** (`.gitignore`, mesmo padrão de
+  `docker-compose/.env`); copie do template commitado `secrets.local.yaml.example` e
+  aplique com `kubectl apply -f secrets.local.yaml` (ver `DEPLOY.md`, seções 3 e 4.1).
 
 **S3 não usa nenhum segredo** — autentica via IAM Role (IRSA), configurada em
-`web.yaml` (`langfuse.serviceAccount.annotations`).
+`values.yaml` (`langfuse.serviceAccount.annotations`).
 
-| Arquivo | Chave(s) usadas de `secrets.yaml` | Wiring no values |
+| Bloco em `values.yaml` | Chave(s) do Secret `langfuse-secrets` | Wiring no values |
 |---|---|---|
-| `web.yaml` / `worker.yaml` | `salt`, `encryption-key`, `nextauth-secret` | `langfuse.salt.secretKeyRef`, `langfuse.encryptionKey.secretKeyRef`, `langfuse.nextauth.secret.secretKeyRef` |
-| `web.yaml` / `worker.yaml` | `DATABASE_URL` (Postgres externo/RDS) | `langfuse.additionalEnv[].valueFrom.secretKeyRef` |
-| `web.yaml` / `worker.yaml` | `LANGFUSE_INIT_*` (9 chaves) | `langfuse.additionalEnv[].valueFrom.secretKeyRef` |
-| `worker.yaml` | `redis-password`, `default` | `redis.auth.existingSecret`/`existingSecretPasswordKey` **e** `redis.auth.usersExistingSecret` (dois consumidores distintos) |
-| `worker.yaml` | `clickhouse-password` | `clickhouse.auth.existingSecret`/`existingSecretKey` |
+| `langfuse.*` | `salt`, `encryption-key`, `nextauth-secret` | `langfuse.salt.secretKeyRef`, `langfuse.encryptionKey.secretKeyRef`, `langfuse.nextauth.secret.secretKeyRef` |
+| `langfuse.*` | `DATABASE_URL` (Postgres externo/RDS) | `langfuse.additionalEnv[].valueFrom.secretKeyRef` |
+| `langfuse.*` | `LANGFUSE_INIT_*` (9 chaves) | `langfuse.additionalEnv[].valueFrom.secretKeyRef` |
+| `redis.*` | `redis-password`, `default` | `redis.auth.existingSecret`/`existingSecretPasswordKey` **e** `redis.auth.usersExistingSecret` (dois consumidores distintos) |
+| `clickhouse.*` | `clickhouse-password` | `clickhouse.auth.existingSecret`/`existingSecretKey` |
 
-⚠️ **`secrets.yaml` contém segredos em texto claro (valores de laboratório, exceto
-`DATABASE_URL` que já precisa apontar para um Postgres real)** — nunca reutilizar em
-produção sem trocar as senhas. Trate como arquivo sensível: **não commitar com valores
-reais** (adicione ao `.gitignore` fora do laboratório) e, para homolog/produção,
-prefira gerar via secret manager externo (Vault, AWS Secrets Manager, External Secrets
-Operator) em vez de um YAML versionado.
+O `ExternalSecret` (`external-secrets/external-secret.yaml`) mapeia cada uma dessas 15
+chaves para um parâmetro `SecureString` em `/langfuse/<AMBIENTE>/<nome>` (ex.:
+`DATABASE_URL` ← `/langfuse/<AMBIENTE>/database-url`) — `redis-password` e `default`
+apontam para o **mesmo** parâmetro, já que o chart usa o mesmo valor em dois lugares
+distintos (`existingSecretPasswordKey` e `usersExistingSecret`). Comandos completos de
+`aws ssm put-parameter` para os 14 parâmetros em `DEPLOY.md`, seção 0.7.
+
+⚠️ **`secrets.local.yaml.example` contém segredos em texto claro (valores de
+laboratório, exceto `DATABASE_URL` que já precisa apontar para um Postgres real) —
+nunca usar em homolog/produção**, apenas Kind/lab. O arquivo real (`secrets.local.yaml`,
+copiado do `.example`) já está no `.gitignore` — nunca remova essa entrada nem force
+o commit com valores reais.
 
 ### Postgres externo (RDS) — sem config estruturada
 
@@ -201,7 +229,7 @@ usuário dedicado `langfuse`), esta stack usa **Postgres externo (RDS)**: a cone
 inteira vem de `DATABASE_URL` (uma connection string completa) via `additionalEnv` —
 **não** defina `postgresql.host`/`postgresql.auth.*` (config estruturada) em nenhum
 arquivo. O chart valida essa exclusividade e `helm template` **falha** se ambos
-estiverem presentes simultaneamente. `postgresql.deploy: false` está em `web.yaml`.
+estiverem presentes simultaneamente. `postgresql.deploy: false` está em `values.yaml`.
 
 ### Variáveis válidas do bootstrap headless (`LANGFUSE_INIT_*`)
 
@@ -222,17 +250,23 @@ qualquer outra **não é lida pela aplicação**:
 | `LANGFUSE_INIT_USER_PASSWORD` | Sim |
 
 A URL pública da app é controlada por `langfuse.nextauth.url` (já wired em
-`web.yaml`/`worker.yaml`) — **não** por uma variável `LANGFUSE_INIT_*`.
+`values.yaml`) — **não** por uma variável `LANGFUSE_INIT_*`.
 
 ### Atualizando segredos após o deploy inicial
 
+Homolog/prod: `aws ssm put-parameter ... --overwrite` + `kubectl annotate
+externalsecret langfuse-secrets -n langfuse force-sync=$(date +%s) --overwrite` para
+forçar a sincronização imediata (senão o ESO já resincroniza sozinho a cada
+`refreshInterval`, 1h). Kind/lab: `kubectl apply -f secrets.local.yaml`. Em ambos os
+casos:
+
 ```bash
-kubectl apply -f secrets.yaml
 kubectl rollout restart deployment/langfuse-web deployment/langfuse-worker -n langfuse
 ```
 
 `secretKeyRef` não é recarregado a quente pelo Kubernetes — o `rollout restart` é
-necessário para os pods lerem os novos valores.
+necessário para os pods lerem os novos valores. Comandos completos em `DEPLOY.md`,
+seção 8.
 
 ⚠️ **O bootstrap headless não é idempotente para atualização, só para criação**: se
 você mudar `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/`_SECRET_KEY` mantendo o mesmo
@@ -247,12 +281,14 @@ continua válida. Para revogar, use a UI (Project Settings → API Keys) ou a AP
 langfuse/
 ├── README.md              # este documento
 ├── DEPLOY.md               # procedimento de deploy passo a passo
-├── secrets.yaml             # Secret K8s "langfuse-secrets" — credenciais (exceto S3, via IAM Role)
-├── web.yaml                 # app (salt/encryptionKey/nextauth/DATABASE_URL/bootstrap) + langfuse.web (imagem ECR) + Ingress ALB + ServiceAccount IRSA + S3
-├── worker.yaml               # app (duplicado) + langfuse.worker (imagem ECR) + Redis/Valkey + ClickHouse + Keeper
+├── secrets.local.yaml.example # template do Secret K8s "langfuse-secrets" p/ Kind/lab (copiar p/ secrets.local.yaml, nunca commitado, NUNCA usar em homolog/prod)
+├── values.yaml              # langfuse.* (salt/encryptionKey/nextauth/DATABASE_URL/bootstrap/web+worker image/Ingress ALB/ServiceAccount IRSA) + postgresql + s3 + redis + clickhouse
+├── external-secrets/
+│   ├── service-account.yaml   # ServiceAccount c/ IRSA dedicada (ssm:GetParameter*/kms:Decrypt)
+│   ├── secret-store.yaml       # SecretStore -> AWS Parameter Store (service: ParameterStore)
+│   └── external-secret.yaml     # sincroniza os 15 valores p/ o Secret "langfuse-secrets" (homolog/prod)
 ├── docker/
-│   ├── web/Dockerfile          # FROM docker.langfuse.com/langfuse/langfuse:4.24.0 (Alpine) — build/push pro ECR
-│   └── worker/Dockerfile        # FROM docker.langfuse.com/langfuse/langfuse-worker:4.24.0 (Alpine) — idem
+│   └── Dockerfile              # multi-stage (Alpine): stage "web" FROM langfuse:4.24.0, stage "worker" FROM langfuse-worker:4.24.0 — build --target web|worker pro ECR
 ├── docker-compose/
 │   ├── docker-compose.yml   # stack completa (web/worker/postgres/valkey/clickhouse/minio) p/ rodar local
 │   └── .env.example          # valores de laboratório (copiar p/ .env, nunca commitar)
@@ -280,7 +316,9 @@ EKS com imagens próprias e Postgres gerenciado (RDS).
   a operação do banco das mãos da equipe de plataforma (backups, patching, HA geridos
   pela AWS).
 - **Segurança**: S3 autenticado via IAM Role (IRSA) — nenhuma credencial estática de
-  object storage circulando em Secrets ou values.
+  object storage circulando em Secrets ou values; segredos de aplicação/banco/fila
+  centralizados no AWS Parameter Store, sincronizados via External Secrets Operator
+  (IRSA própria, least-privilege) — nenhum segredo versionado em Git em homolog/prod.
 - **Financeiros**: elimina custo de licenciamento SaaS do Langfuse Cloud; custo passa a
   ser apenas a infraestrutura já existente do cliente.
 
@@ -288,10 +326,11 @@ EKS com imagens próprias e Postgres gerenciado (RDS).
 
 | Risco | Impacto | Mitigação |
 |---|---|---|
-| `secrets.yaml` contém segredos em texto claro (valores de laboratório) | Alto | Nunca commitar com valores reais; usar secret manager externo em homolog/prod (ver seção 5) |
+| `secrets.local.yaml.example` contém segredos em texto claro (valores de laboratório) | Médio | Usar apenas em Kind/lab; homolog/prod usam Parameter Store + ESO (ver seção 5) — o arquivo real (`secrets.local.yaml`) já está no `.gitignore`, nunca commitar com valores reais |
+| ESO indisponível ou `SecretStore`/`ExternalSecret` mal configurados impedem a criação do Secret `langfuse-secrets` | Alto | Validar `kubectl get secretstore/externalsecret -n langfuse` e `kubectl describe externalsecret langfuse-secrets -n langfuse` antes do `helm install` (ver `DEPLOY.md`, seção 0.7) |
 | Redis e ClickHouse com 1 réplica cada (exceto Keeper) | Médio | Sem HA real; avaliar `cluster.replicas` maior para homolog/prod |
 | Sem `NetworkPolicy` definida | Médio | Adicionar antes de expor publicamente |
-| Ingress/TLS/IRSA/ECR/RDS (`web.yaml`/`worker.yaml`) usam placeholders (`<...>`) — não funcionam até serem substituídos | Alto | Preencher antes do deploy; `helm template` não valida se são reais |
+| Ingress/TLS/IRSA/ECR/RDS/Parameter Store (`values.yaml`/`external-secrets/*.yaml`) usam placeholders (`<...>`) — não funcionam até serem substituídos | Alto | Preencher antes do deploy; `helm template` não valida se são reais |
 | Mistura de `additionalEnv` (DATABASE_URL) com config estruturada do Postgres quebra o `helm template` | Alto | Nunca definir `postgresql.host`/`auth.*` junto com `DATABASE_URL` via additionalEnv (ver seção 5) |
 | ClickHouse Operator + cert-manager são pré-requisitos externos ao chart | Médio | Comandos de instalação documentados na seção 4 / `DEPLOY.md` seção 0 |
 | ClickHouse Kubernetes Operator é classificado como *alpha-quality* pelo próprio chart do Langfuse | Médio | Revisar release notes antes de upgrades; fixar a versão do operator explicitamente (`--version`) |
@@ -307,6 +346,9 @@ EKS com imagens próprias e Postgres gerenciado (RDS).
 | ECR | Armazenamento de imagens + data transfer | Baixo, cobrado por GB armazenado |
 | S3 | Eventos e mídia do Langfuse | Armazenamento + requests; zero custo de credencial (IAM Role) |
 | ALB | Load Balancer do Ingress | Custo fixo por hora + por LCU; certificado ACM é gratuito |
+| Parameter Store (SSM) | 14 parâmetros `SecureString`, tier Standard | Tier Standard é gratuito (até 10.000 parâmetros, ≤4KB); custo só existe se migrar para tier Advanced ou volume alto de API calls |
+| KMS | `kms:Decrypt` dos parâmetros `SecureString` | Key gerenciada (`alias/aws/ssm`) sem custo mensal fixo, cobrada por requisição (~US$0,03/10k); CMK dedicada tem custo fixo mensal por key |
+| External Secrets Operator | Compute do pod do controller | Marginal — soma ao compute já contado dos nós do cluster |
 | Licenciamento | Nenhum — Langfuse é open source (self-hosted) | Sem custo de software |
 
 > Estimativa qualitativa — não há preços fechados pois depende da região AWS, classe
@@ -327,11 +369,11 @@ helm repo add langfuse https://langfuse.github.io/langfuse-k8s
 helm repo update
 
 helm template langfuse langfuse/langfuse -n langfuse \
-  -f web.yaml -f worker.yaml \
+  -f values.yaml \
   --api-versions clickhouse.com/v1alpha1/ClickHouseCluster \
   --api-versions clickhouse.com/v1alpha1/KeeperCluster
 
-helm lint <chart-local> -f web.yaml -f worker.yaml --set clickhouse.crdCheck=false
+helm lint <chart-local> -f values.yaml --set clickhouse.crdCheck=false
 ```
 
 Resultado: **0 erros**. Numa revisão do repositório (após edições externas aos
@@ -352,7 +394,52 @@ desconhecida), então `helm lint`/`helm template` **passam mesmo com a stack que
 > renderização offline (`crdCheck: true` bloqueia `helm template` sem um cluster real
 > conectado, que é o comportamento correto para um `helm install` de verdade).
 
+**Unificação `web.yaml`+`worker.yaml` → `values.yaml`**: antes de apagar os dois
+arquivos, rodei `helm template ... -f web.yaml -f worker.yaml` e `helm template ... -f
+values.yaml` e comparei os manifestos renderizados com `diff` — **saída idêntica, 0
+linhas de diferença**. Confirma que o merge por chave top-level do Helm (`langfuse`,
+`postgresql`, `s3`, `redis`, `clickhouse`) não depende de quantos arquivos `-f` são
+passados nem da ordem — juntar tudo num único `values.yaml` é puramente
+organizacional, sem risco de regressão.
+
+**Unificação `docker/web/Dockerfile`+`docker/worker/Dockerfile` → `docker/Dockerfile`**:
+consolidados num único Dockerfile multi-stage (`FROM ... AS web` / `FROM ... AS worker`),
+build selecionado via `docker build --target web|worker -f docker/Dockerfile docker`.
+Validado com builds reais dos dois targets: **cache hit total** nas duas imagens (mesmas
+layers de antes, sem rebuild) e `docker inspect` confirmando `USER`/`ENTRYPOINT`/`CMD`/
+`HEALTHCHECK` idênticos aos Dockerfiles separados (`web`: `User=nextjs`, herda
+`ENTRYPOINT`/`CMD` da imagem oficial, `HEALTHCHECK` via `curl`; `worker`:
+`User=expressjs`, `ENTRYPOINT=[dumb-init -- ./worker/entrypoint.sh]`,
+`CMD=[node worker/dist/index.js]`) — `docker run` do worker sem `DATABASE_URL` produz o
+mesmo erro esperado de antes.
+
 **Validado com builds reais**: `docker build` das duas imagens corrigidas teve
 sucesso, e `docker run` de ambas produziu o erro esperado (`DATABASE_URL not set`),
 confirmando que `ENTRYPOINT`/`USER` continuam intactos (não foram quebrados pelas
 correções).
+
+### Validação dos manifests do External Secrets Operator (`external-secrets/`)
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm template eso external-secrets/external-secrets --version 2.10.0 \
+  -n external-secrets --include-crds > /tmp/eso-rendered.yaml   # extrai as CRDs reais do chart 2.10.0
+# (as 24 CRDs foram isoladas do restante do manifesto renderizado e aplicadas
+# com --server-side, pois duas delas excedem o limite de annotation do apply client-side)
+
+kubectl apply -f /tmp/eso-crds-only.yaml --context kind-langfuse-lab --server-side --force-conflicts
+
+kubectl apply -f external-secrets/service-account.yaml --dry-run=server --context kind-langfuse-lab
+kubectl apply -f external-secrets/secret-store.yaml --dry-run=server --context kind-langfuse-lab
+kubectl apply -f external-secrets/external-secret.yaml --dry-run=server --context kind-langfuse-lab
+```
+
+Resultado: **0 erros** — os 3 manifests passam na validação *server-side* do
+`kube-apiserver` contra o schema real (OpenAPI) das CRDs `SecretStore` e
+`ExternalSecret` do chart `external-secrets/external-secrets` v2.10.0. Confirmado via
+Context7 (`/websites/external-secrets_io`) e inspeção direta do schema (`service:
+ParameterStore` é um valor válido do enum `spec.provider.aws.service`;
+`auth.jwt.serviceAccountRef.name` existe no schema do `SecretStore`; `data[].secretKey`/
+`data[].remoteRef.key`/`target.creationPolicy`/`refreshInterval` existem no schema do
+`ExternalSecret`). CRDs e namespace de teste removidos do Kind local após a validação —
+nada foi aplicado no EKS real.
