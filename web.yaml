@@ -1,108 +1,71 @@
-# ==============================================================================
-# Configurações do Langfuse - Web (App) + segredos/env compartilhados + S3 + Ingress
-# ------------------------------------------------------------------------------
-# Fontes oficiais:
-#   - https://github.com/langfuse/langfuse-k8s (README)
-#   - https://github.com/langfuse/langfuse-k8s/blob/main/charts/langfuse/values.yaml
-#   - https://github.com/langfuse/langfuse-k8s/tree/main/examples/minimal-installation
-#
-# Stack simplificada para 3 arquivos + secrets.yaml (sem values.yaml/eks.yaml):
-#   web.yaml     -> este arquivo: app compartilhado + web + S3 + Ingress + IRSA
-#   worker.yaml  -> app compartilhado (duplicado) + worker + Redis + ClickHouse
-#   postgres.yaml -> postgresql
-# Cada bloco fica no arquivo do serviço mais associado a ele: web.yaml concentra
-# tudo que é "voltado pra fora" (como a app é exposta e acessa object storage);
-# worker.yaml concentra o pipeline de ingestão (fila Redis + sink ClickHouse).
-# Como Helm faz merge por chave top-level, não importa em qual -f cada chave
-# está — o resultado final é o mesmo independente da ordem/arquivo de origem.
-#
-# Credenciais vêm do Secret "langfuse" (secrets.yaml) — aplicar com
-# `kubectl apply -f secrets.yaml` ANTES do helm install/upgrade (ver DEPLOY.md).
-#
-# Correção: `langfuse.replicaCount` e `langfuse.env` não existem no schema
-# real do chart — a chave correta de réplicas é `langfuse.web.replicas`.
-#
-# TROQUE os valores <...> antes de aplicar em produção (ARNs, bucket, região,
-# account ID, host do Ingress). `langfuse.nextauth.url` já vem com um default
-# válido (localhost) — para produção, sobrescreva via --set em vez de editar
-# (Next.js valida como URL de verdade; um placeholder tipo "<...>" quebra o
-# boot com "Invalid URL"). Pré-requisitos de EKS (AWS Load Balancer Controller,
-# EBS CSI Driver, IAM Role IRSA, certificado ACM) documentados no DEPLOY.md.
-# ==============================================================================
 langfuse:
   salt:
     secretKeyRef:
-      name: langfuse
+      name: langfuse-secrets
       key: salt
   encryptionKey:
     secretKeyRef:
-      name: langfuse
+      name: langfuse-secrets
       key: encryption-key
-  # Default seguro (URL válida) para não quebrar o boot — o Next.js valida
-  # NEXTAUTH_URL como URL de verdade e falha com "Invalid URL" em placeholders
-  # tipo "<SEU_DOMINIO>" (confirmado ao vivo no Kind). Para produção, troque via
-  # --set langfuse.nextauth.url=https://seu-dominio-real.com (ver DEPLOY.md).
   nextauth:
-    url: "http://localhost:3000"
+    url: "https://langfuse.meudominio.com"
     secret:
       secretKeyRef:
-        name: langfuse
+        name: langfuse-secrets
         key: nextauth-secret
 
-  # Headless initialization (cria org/projeto/usuário/API key no 1º start,
-  # sem precisar passar pela tela de "Sign up" na UI) — só para laboratório.
-  # https://langfuse.com/self-hosting/administration/headless-initialization
   additionalEnv:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: langfuse-secrets
+          key: DATABASE_URL
     - name: LANGFUSE_INIT_ORG_ID
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_ORG_ID
     - name: LANGFUSE_INIT_ORG_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_ORG_NAME
     - name: LANGFUSE_INIT_PROJECT_ID
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_ID
     - name: LANGFUSE_INIT_PROJECT_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_NAME
     - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
     - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_SECRET_KEY
     - name: LANGFUSE_INIT_USER_EMAIL
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_EMAIL
     - name: LANGFUSE_INIT_USER_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_NAME
     - name: LANGFUSE_INIT_USER_PASSWORD
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_PASSWORD
 
-  # IRSA: associa a Service Account do Langfuse à IAM Role com acesso ao
-  # bucket S3 (ver `s3:` abaixo) — sem access key/secret key fixos, a app usa
-  # o AWS SDK default credential chain (identidade do pod). Policy mínima em
-  # eks-iam-policy.json.
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: "arn:aws:iam::<SEU_ACCOUNT_ID>:role/<NOME_DA_ROLE_IRSA>"
@@ -114,46 +77,40 @@ langfuse:
       alb.ingress.kubernetes.io/scheme: internet-facing
       alb.ingress.kubernetes.io/target-type: ip
       alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-      alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:<SUA_REGIAO>:<SEU_ACCOUNT_ID>:certificate/<ID_DO_CERTIFICADO>"
+      alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:<SEU_ACCOUNT_ID>:certificate/<ID_DO_CERTIFICADO>"
+      alb.ingress.kubernetes.io/healthcheck-path: "/api/public/health"
     hosts:
-      - host: "<SEU_DOMINIO>"
+      - host: "langfuse.meudominio.com"
         paths:
           - path: /
-            pathType: ImplementationSpecific
+            pathType: Prefix
     tls:
-      # TLS é terminado no ALB via certificate-arn acima — não precisa de
-      # Secret de TLS no cluster.
       enabled: false
 
   web:
-    replicas: 1
+    replicas: 2
+    image:
+      repository: "<SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web"
+      tag: "4.24.0"
+      pullPolicy: IfNotPresent
     resources:
       requests:
-        cpu: "100m"
+        cpu: "500m"
         memory: "1Gi"
       limits:
-        cpu: "1000m"
+        cpu: "1"
         memory: "2Gi"
 
-# ------------------------------------------------------------------------------
-# SeaweedFS embutido do chart — desativado (usamos S3 real via IAM Role abaixo).
-# ------------------------------------------------------------------------------
+postgresql:
+  deploy: false
+
 seaweedfs:
   enabled: false
 
-# ------------------------------------------------------------------------------
-# S3 real via IAM Role (IRSA) — usado tanto pelo web quanto pelo worker (env
-# S3_* injetada pelo chart nos dois pods a partir desta única chave top-level
-# `s3:`, independente de qual arquivo a define).
-#
-# Confirmado via documentação oficial do Langfuse (blobstorage.mdx, seção
-# "Amazon S3"): "When running on AWS, Langfuse recommends assigning an IAM
-# role to the container" — por isso não há accessKeyId/secretAccessKey aqui.
-# ------------------------------------------------------------------------------
 s3:
   deploy: false
   storageProvider: "s3"
-  bucket: "<SEU_BUCKET_S3>"
-  region: "<SUA_REGIAO_AWS>"
-  endpoint: "" # vazio = endpoint padrão da AWS
+  bucket: "meu-langfuse-bucket-producao"
+  region: "us-east-1"
+  endpoint: ""
   forcePathStyle: false

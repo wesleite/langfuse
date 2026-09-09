@@ -1,103 +1,86 @@
-# ==============================================================================
-# Configurações do Langfuse - Worker + Redis/Valkey + ClickHouse (pipeline de ingestão)
-# ------------------------------------------------------------------------------
-# Fontes oficiais:
-#   - https://github.com/langfuse/langfuse-k8s (README)
-#   - https://github.com/langfuse/langfuse-k8s/blob/main/charts/langfuse/values.yaml
-#   - https://github.com/langfuse/langfuse-k8s/tree/main/examples/minimal-installation
-#
-# Duplica os mesmos segredos/env de web.yaml (salt/encryptionKey/nextauth/
-# additionalEnv) para que este arquivo seja autossuficiente. Redis (fila de
-# ingestão) e ClickHouse (destino dos eventos processados) ficam aqui — é o
-# worker quem consome a fila e escreve nesses dois — embora web também os
-# leia/use; como o Helm faz merge por chave top-level, não importa em qual -f
-# cada bloco está, o resultado final é idêntico.
-#
-# Correção: `langfuse.replicaCount`/`langfuse.env` não existem no schema real
-# do chart; usar `langfuse.worker.replicas`.
-#
-# TROQUE `redis.dataStorage.className`/`clickhouse.*.storage.className` para
-# "" (ou remova) se seu cluster não tiver uma StorageClass "gp3" (ex: Kind).
-# ==============================================================================
 langfuse:
   salt:
     secretKeyRef:
-      name: langfuse
+      name: langfuse-secrets
       key: salt
   encryptionKey:
     secretKeyRef:
-      name: langfuse
+      name: langfuse-secrets
       key: encryption-key
-  # Default seguro (URL válida) — ver comentário em web.yaml. Para produção,
-  # troque via --set langfuse.nextauth.url=https://seu-dominio-real.com.
   nextauth:
-    url: "http://localhost:3000"
+    url: "https://langfuse.meudominio.com"
     secret:
       secretKeyRef:
-        name: langfuse
+        name: langfuse-secrets
         key: nextauth-secret
 
-  # Headless initialization — ver web.yaml e secrets.yaml.
   additionalEnv:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: langfuse-secrets
+          key: DATABASE_URL
+
     - name: LANGFUSE_INIT_ORG_ID
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_ORG_ID
     - name: LANGFUSE_INIT_ORG_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_ORG_NAME
     - name: LANGFUSE_INIT_PROJECT_ID
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_ID
     - name: LANGFUSE_INIT_PROJECT_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_NAME
     - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
     - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_PROJECT_SECRET_KEY
     - name: LANGFUSE_INIT_USER_EMAIL
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_EMAIL
     - name: LANGFUSE_INIT_USER_NAME
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_NAME
     - name: LANGFUSE_INIT_USER_PASSWORD
       valueFrom:
         secretKeyRef:
-          name: langfuse
+          name: langfuse-secrets
           key: LANGFUSE_INIT_USER_PASSWORD
 
   worker:
-    replicas: 1
+    replicas: 2
+    image:
+      repository: "<SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker"
+      tag: "4.24.0"
+      pullPolicy: IfNotPresent
     resources:
       requests:
-        cpu: "50m"
-        memory: "512Mi"
-      limits:
-        cpu: "1000m"
+        cpu: "500m"
         memory: "1Gi"
+      limits:
+        cpu: "1"
+        memory: "2Gi"
 
-# ------------------------------------------------------------------------------
-# Redis/Valkey — fila de ingestão consumida pelo worker.
-# ------------------------------------------------------------------------------
 redis:
   deploy: true
   host: "langfuse-redis"
@@ -105,11 +88,9 @@ redis:
   auth:
     enabled: true
     username: "default"
-    existingSecret: langfuse
+    existingSecret: langfuse-secrets
     existingSecretPasswordKey: redis-password
-    # Secret com 1 chave por usuário ACL (chave == username), consumido
-    # diretamente pelo subchart valkey-io/valkey — ver secrets.yaml.
-    usersExistingSecret: langfuse
+    usersExistingSecret: langfuse-secrets
   resources:
     requests:
       cpu: "25m"
@@ -118,11 +99,8 @@ redis:
       cpu: "100m"
       memory: "128Mi"
   dataStorage:
-    className: gp3 # EBS no EKS — remova/deixe "" no Kind (usa "standard")
+    className: gp3
 
-# ------------------------------------------------------------------------------
-# ClickHouse + Keeper — destino dos eventos processados pelo worker.
-# ------------------------------------------------------------------------------
 clickhouse:
   deploy: true
   host: "langfuse-clickhouse-headless"
@@ -132,7 +110,7 @@ clickhouse:
   crdCheck: true
   auth:
     username: default
-    existingSecret: langfuse
+    existingSecret: langfuse-secrets
     existingSecretKey: clickhouse-password
   cluster:
     enabled: true
@@ -146,10 +124,10 @@ clickhouse:
         memory: "1.5Gi"
     storage:
       size: 3Gi
-      className: gp3 # EBS no EKS — remova/deixe "" no Kind
+      className: gp3
   keeper:
     enabled: true
     replicas: 3
     storage:
       size: 3Gi
-      className: gp3 # EBS no EKS — remova/deixe "" no Kind
+      className: gp3
