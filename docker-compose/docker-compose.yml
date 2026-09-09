@@ -1,0 +1,186 @@
+# ==============================================================================
+# Stack Langfuse — ambiente local via Docker Compose
+# ------------------------------------------------------------------------------
+# Baseado no docker-compose.yml oficial do Langfuse v4
+# (github.com/langfuse/langfuse/blob/main/docker-compose.yml, confirmado via
+# Context7 /langfuse/langfuse-docs), adaptado com os mesmos valores de
+# laboratório usados em ../secrets.yaml (deploy no Kind/EKS) para consistência
+# entre ambientes.
+#
+# Uso:
+#   cp .env.example .env   # ajuste se quiser valores diferentes
+#   docker compose up -d
+#   docker compose logs -f langfuse-web langfuse-worker
+# ==============================================================================
+
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-senha_banco_segura_123!}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      # postgres:18+ exige PGDATA num subdiretório do mount (não na raiz) —
+      # mesmo padrão usado pelo subchart do Helm chart do Langfuse.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  valkey:
+    image: valkey/valkey:8.0
+    restart: unless-stopped
+    command: ["valkey-server", "--requirepass", "${REDIS_AUTH:-senha_redis_segura_123!}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -a ${REDIS_AUTH:-senha_redis_segura_123!} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.4
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-senha_clickhouse_segura_123!}
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9002:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-minio}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:-miniosecret}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${S3_ACCESS_KEY_ID:-minio} ${S3_SECRET_ACCESS_KEY:-miniosecret} &&
+      mc mb --ignore-existing local/langfuse
+      "
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4.24.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment: &langfuse-env
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-chave_nextauth_aleatoria_super_segura_local}
+      SALT: ${SALT:-salt_para_senhas_muito_seguro_local}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-senha_banco_segura_123!}@postgres:5432/${POSTGRES_DB:-postgres}
+
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-senha_clickhouse_segura_123!}
+      CLICKHOUSE_CLUSTER_ENABLED: "false" # standalone no Compose — sem operator/Keeper
+
+      REDIS_HOST: valkey
+      REDIS_PORT: 6379
+      REDIS_AUTH: ${REDIS_AUTH:-senha_redis_segura_123!}
+      REDIS_TLS_ENABLED: "false"
+
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minio}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-miniosecret}
+      # Endpoint EXTERNO (acessível pelo navegador) — diferente do event upload,
+      # pois URLs de mídia são presigned e baixadas direto pelo cliente.
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+      LANGFUSE_S3_BATCH_EXPORT_ENABLED: "false"
+
+      # Headless init — mesmos valores de ../secrets.yaml, para reaproveitar as
+      # mesmas API keys nos scripts de ../tests/ contra o Compose.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-lab-org}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-Lab}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-lab-project}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-Lab Project}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:-pk-lf-00000000-0000-0000-0000-000000000000}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:-sk-lf-00000000-0000-0000-0000-000000000000}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@lab.local}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-Lab Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-senha_admin_local_123!}
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4.24.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:3030:3030"
+    environment:
+      <<: *langfuse-env
+
+volumes:
+  postgres_data:
+  valkey_data:
+  clickhouse_data:
+  minio_data:

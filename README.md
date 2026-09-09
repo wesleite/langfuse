@@ -112,6 +112,46 @@ Para laboratório/local, use **Kind** (cluster Kubernetes) + **LocalStack** para
 (já refletido em `values.yaml`, que aponta `S3_ENDPOINT` para um MinIO local em vez de
 AWS S3 real). Nunca provisionar recursos AWS pagos para este cenário.
 
+### Ambiente local via Docker Compose (alternativa mais rápida ao Kind)
+
+Para quem só quer subir a stack rapidamente sem Kubernetes, `docker-compose/`
+contém uma stack equivalente baseada no `docker-compose.yml` oficial do Langfuse
+v4 (confirmado via Context7), adaptada com os mesmos valores de laboratório de
+`secrets.yaml`:
+
+```bash
+cd docker-compose
+cp .env.example .env   # ajuste se quiser valores diferentes dos defaults
+docker compose up -d
+```
+
+Diferenças em relação ao deploy K8s (Kind/EKS):
+
+| Item | K8s (Helm chart) | Docker Compose |
+|---|---|---|
+| ClickHouse | Cluster + 3 Keepers via Operator | Container único, `CLICKHOUSE_CLUSTER_ENABLED: false` (sem Keeper) |
+| Redis/Valkey | ACL via Secret montado como volume | Senha via `--requirepass` |
+| S3/MinIO | Deploy manual à parte (não gerenciado pelo chart) | Serviço `minio` + `minio-init` (cria o bucket `langfuse` automaticamente) |
+| Segredos | `secrets.yaml` (K8s `Secret`) | `docker-compose/.env` (mesmos valores, nunca commitado — ver `.gitignore`) |
+| Bootstrap headless | `langfuse.additionalEnv` no chart | Env vars diretas no `docker-compose.yml` |
+
+Validado de ponta a ponta: `docker compose up -d` → todos os serviços `healthy` →
+bootstrap headless cria `lab-org`/`lab-project` → os 3 scripts em `tests/` rodam
+com sucesso → ingestão confirmada em `events_core` no ClickHouse (mesma validação
+feita no Kind).
+
+⚠️ **Gotcha do Postgres 18+**: a imagem oficial `postgres:18` exige que `PGDATA`
+fique num subdiretório do volume montado (não na raiz de `/var/lib/postgresql/data`),
+senão o container entra em crash loop reclamando de "unused mount". O
+`docker-compose.yml` já define `PGDATA: /var/lib/postgresql/data/pgdata` para
+evitar isso — mesmo padrão usado internamente pelo subchart `groundhog2k/postgres`
+do Helm chart.
+
+```bash
+docker compose down          # para os containers, mantém os volumes
+docker compose down -v       # para e apaga os volumes (reset completo)
+```
+
 ---
 
 ## 5. Segredos (secrets.yaml)
@@ -208,6 +248,9 @@ langfuse/
 │   ├── redis/Dockerfile
 │   ├── clickhouse/Dockerfile
 │   └── clickhouse-keeper/Dockerfile
+├── docker-compose/
+│   ├── docker-compose.yml   # stack completa (web/worker/postgres/valkey/clickhouse/minio) p/ rodar local
+│   └── .env.example          # valores de laboratório (copiar p/ .env, nunca commitar)
 └── tests/
     ├── teste-langfuse.py       # valida envio de trace via SDK Python
     ├── teste-otel.py           # valida fluxo RAG (span + generation aninhados)
