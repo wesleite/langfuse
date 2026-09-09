@@ -72,7 +72,7 @@ kubectl get crd | grep clickhouse.com   # deve listar clickhousecluster e keeper
   (nem todo cluster EKS vem com uma por padrão — Redis e ClickHouse/Keeper usam)
 - **Bucket S3** real criado
 - **IAM Role (IRSA)** com permissão de leitura/escrita nesse bucket, associada à
-  Service Account do Langfuse via `eks.amazonaws.com/role-arn` (`web.yaml`) — sem
+  Service Account do Langfuse via `eks.amazonaws.com/role-arn` (`values.yaml`) — sem
   access key/secret key fixos, autenticação por identidade do pod. Policy mínima
   necessária (confirmada na documentação oficial do Langfuse, seção *Amazon S3*):
   ```json
@@ -90,7 +90,9 @@ kubectl get crd | grep clickhouse.com   # deve listar clickhousecluster e keeper
 - **Certificado ACM** emitido para o domínio público (referenciado no Ingress)
 - **Repositórios ECR** criados para `langfuse-web` e `langfuse-worker` (ver seção 0.6)
 - **Instância RDS PostgreSQL** provisionada, acessível a partir do cluster (mesma VPC/
-  security group liberado) — ver seção 0.7
+  security group liberado) — ver seção 0.7.1
+- **External Secrets Operator + parâmetros no AWS Systems Manager Parameter Store**
+  configurados (segredos não vêm mais de um YAML estático em homolog/prod) — ver seção 0.7
 
 ```bash
 # Verificar
@@ -99,16 +101,17 @@ kubectl get sa -n kube-system aws-load-balancer-controller 2>&1
 kubectl get storageclass gp3
 ```
 
-Antes de aplicar, substitua todos os placeholders `<...>` em `web.yaml` (domínio, ARNs,
-bucket, região, account ID, repo ECR) e `worker.yaml` (repo ECR, `className: gp3`, se
-seu cluster usar outro nome de StorageClass).
+Antes de aplicar, substitua todos os placeholders `<...>` em `values.yaml` (domínio,
+ARNs, bucket, região, account ID, repos ECR de web/worker, `className: gp3` se seu
+cluster usar outro nome de StorageClass).
 
 ### 0.6. Build e push das imagens para o ECR
 
 Este repositório não contém o código-fonte do Langfuse — as imagens usadas são as
-oficiais (`docker.langfuse.com/langfuse/langfuse(-worker):4.24.0`), com os Dockerfiles
-em `docker/web/` e `docker/worker/` servindo de base para customização (certs, health
-check) antes do push para o seu ECR:
+oficiais (`docker.langfuse.com/langfuse/langfuse(-worker):4.24.0`), com um único
+`docker/Dockerfile` (multi-stage, stages `web` e `worker`, selecionados via
+`--target`) servindo de base para customização (certs, healthcheck) antes do push
+para o seu ECR:
 
 ```bash
 aws ecr create-repository --repository-name langfuse-web --region <SUA_REGIAO_AWS>
@@ -117,24 +120,138 @@ aws ecr create-repository --repository-name langfuse-worker --region <SUA_REGIAO
 aws ecr get-login-password --region <SUA_REGIAO_AWS> | \
   docker login --username AWS --password-stdin <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com
 
-docker build -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web:4.24.0 \
-  -f docker/web/Dockerfile docker/web
+docker build --target web -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web:4.24.0 \
+  -f docker/Dockerfile docker
 docker push <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-web:4.24.0
 
-docker build -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker:4.24.0 \
-  -f docker/worker/Dockerfile docker/worker
+docker build --target worker -t <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker:4.24.0 \
+  -f docker/Dockerfile docker
 docker push <SEU_ACCOUNT_ID>.dkr.ecr.<SUA_REGIAO_AWS>.amazonaws.com/langfuse-worker:4.24.0
 ```
 
-`web.yaml`/`worker.yaml` já apontam `langfuse.web.image.repository`/
+`values.yaml` já aponta `langfuse.web.image.repository`/
 `langfuse.worker.image.repository` para esse padrão de URI — só trocar
 `<SEU_ACCOUNT_ID>`/`<SUA_REGIAO_AWS>`.
 
-### 0.7. Postgres externo (RDS) — sem Postgres bundled
+### 0.7. Segredos via AWS Systems Manager Parameter Store (homolog/prod)
+
+Em homolog/prod, os segredos **não** vêm mais de um `Secret` estático versionado
+(`secrets.local.yaml`, mantido só para Kind/lab — seção 4.1). Em vez disso, o
+**External Secrets Operator (ESO)** sincroniza os valores do **AWS Systems Manager
+Parameter Store** para o mesmo Secret `langfuse-secrets` que `values.yaml` já espera
+via `secretKeyRef` — nenhuma mudança nos values do chart. Confirmado via
+Context7 (`/websites/external-secrets_io`).
+
+**a) Instalar o External Secrets Operator** (uma vez por cluster, namespace próprio):
+
+```bash
+helm repo add external-secrets https://charts.external-secrets.io
+helm repo update
+
+helm install external-secrets external-secrets/external-secrets \
+  -n external-secrets --create-namespace
+```
+
+**b) Criar a IAM Role (IRSA) dedicada ao ESO** — role **separada** da IRSA de S3
+(`values.yaml`), least-privilege, restrita ao path `/langfuse/<AMBIENTE>/*`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "LangfuseParameterStoreRead",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"],
+      "Resource": "arn:aws:ssm:<SUA_REGIAO_AWS>:<SEU_ACCOUNT_ID>:parameter/langfuse/<AMBIENTE>/*"
+    },
+    {
+      "Sid": "LangfuseParameterStoreDecrypt",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:<SUA_REGIAO_AWS>:<SEU_ACCOUNT_ID>:key/<ID_DA_CHAVE_KMS>"
+    }
+  ]
+}
+```
+
+> ⚠️ Se usar a key gerenciada padrão do SSM (`alias/aws/ssm`, aplicada automaticamente
+> a todo parâmetro `SecureString` sem `--key-id` explícito), o `Resource` do statement
+> de `kms:Decrypt` precisa ser o **ARN da key** (não o alias) — obtenha com
+> `aws kms describe-key --key-id alias/aws/ssm --query KeyMetadata.Arn`. Para
+> auditoria via CloudTrail mais granular, prefira uma **CMK dedicada**
+> (`aws kms create-key`) e aponte o `--key-id` no `put-parameter` abaixo.
+
+Associe essa role à ServiceAccount `langfuse-external-secrets` via
+`eks.amazonaws.com/role-arn` (já preparado em `external-secrets/service-account.yaml`
+— só falta substituir `<SEU_ACCOUNT_ID>`/`<NOME_DA_ROLE_IRSA_PARAMETER_STORE>`).
+
+**c) Criar os parâmetros no Parameter Store** (todos como `SecureString`; troque
+`<AMBIENTE>` por `homolog`/`prod` e preencha os valores reais):
+
+```bash
+REGIAO="<SUA_REGIAO_AWS>"
+AMBIENTE="<AMBIENTE>"
+
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/database-url" \
+  --value "postgresql://usuario:senha@seu-rds.cluster-xxxx.$REGIAO.rds.amazonaws.com:5432/langfuse"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/encryption-key" --value "$(openssl rand -hex 32)"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/salt" --value "$(openssl rand -base64 32)"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/nextauth-secret" --value "$(openssl rand -base64 32)"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/redis-password" --value "<SENHA_REDIS_GERADA>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/clickhouse-password" --value "<SENHA_CLICKHOUSE_GERADA>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-org-id" --value "<ORG_ID>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-org-name" --value "<ORG_NAME>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-project-id" --value "<PROJECT_ID>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-project-name" --value "<PROJECT_NAME>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-project-public-key" --value "pk-lf-$(uuidgen)"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-project-secret-key" --value "sk-lf-$(uuidgen)"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-user-email" --value "<EMAIL_ADMIN>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-user-name" --value "<NOME_ADMIN>"
+aws ssm put-parameter --region "$REGIAO" --type SecureString --overwrite \
+  --name "/langfuse/$AMBIENTE/init-user-password" --value "<SENHA_ADMIN_GERADA>"
+```
+
+**d) Aplicar os manifests do ESO** (substitua `<...>` em
+`external-secrets/*.yaml` antes — região, account ID, ARN da role, `<AMBIENTE>`):
+
+```bash
+kubectl apply -f external-secrets/service-account.yaml
+kubectl apply -f external-secrets/secret-store.yaml
+kubectl apply -f external-secrets/external-secret.yaml
+
+# Validar
+kubectl get secretstore -n langfuse
+kubectl get externalsecret -n langfuse
+kubectl get secret langfuse-secrets -n langfuse   # deve existir, criado pelo ESO
+```
+
+O `ExternalSecret` recria/atualiza o Secret `langfuse-secrets` automaticamente a cada
+`refreshInterval` (1h) e a cada mudança no parâmetro — **não** é necessário
+`kubectl apply -f secrets.local.yaml` nem `kubectl rollout restart` manual após trocar
+um valor no Parameter Store (o ESO detecta o drift; o rollout dos pods ainda precisa
+ser manual, pois `secretKeyRef` não é hot-reload — ver seção 8).
+
+### 0.7.1. Postgres externo (RDS) — sem Postgres bundled
 
 Esta stack **não** implanta Postgres dentro do cluster (`postgresql.deploy: false` em
-`web.yaml`). A conexão inteira vem de uma única variável, `DATABASE_URL`, injetada via
-`langfuse.additionalEnv` a partir de `secrets.yaml`:
+`values.yaml`). A conexão inteira vem de uma única variável, `DATABASE_URL`, injetada via
+`langfuse.additionalEnv` a partir do Secret `langfuse-secrets` (Parameter Store em
+homolog/prod — seção 0.7; `secrets.local.yaml` em Kind/lab — seção 4.1):
 
 ```yaml
 DATABASE_URL: "postgresql://usuario:senha@seu-rds.cluster-xxxx.regiao.rds.amazonaws.com:5432/langfuse"
@@ -173,27 +290,33 @@ helm repo update
 
 ---
 
-## 3. Aplicar os segredos (secrets.yaml)
+## 3. Aplicar os segredos
 
 Todas as credenciais da stack (app, Postgres externo, Redis/Valkey, ClickHouse e o
-bootstrap headless) vêm de um único `Secret` Kubernetes — **`secrets.yaml`, nome
-`langfuse-secrets`** — referenciado pelos values via `existingSecret`/`secretKeyRef`.
-**S3 não usa segredo nenhum** — autentica via IAM Role (IRSA), ver seção 0.5.
-**Aplicar antes do `helm install`**:
+bootstrap headless) vêm de um único `Secret` Kubernetes, nome **`langfuse-secrets`**
+— referenciado pelos values via `existingSecret`/`secretKeyRef`. **S3 não usa segredo
+nenhum** — autentica via IAM Role (IRSA), ver seção 0.5. Como esse Secret é criado
+depende do ambiente:
 
-```bash
-kubectl apply -f secrets.yaml
-```
+- **Homolog/prod**: o Secret é criado e mantido pelo **External Secrets Operator** a
+  partir do **Parameter Store** — nada a aplicar aqui, já feito na seção 0.7
+  (`kubectl apply -f external-secrets/*.yaml`). **Aplicar antes do `helm install`.**
+- **Kind/lab (seção 4.1)**: `secrets.local.yaml` **não é versionado** (está no
+  `.gitignore`, mesmo padrão de `docker-compose/.env`) — copie do template commitado
+  `secrets.local.yaml.example` e aplique:
 
-⚠️ **Valores de laboratório** — o arquivo já vem preenchido com senhas fixas para uso
-local (exceto `DATABASE_URL`, que já precisa ser um RDS real ou outro Postgres externo
-acessível). **Nunca reutilizar em produção**: gere valores únicos (`openssl rand -hex 32`
-para `encryption-key`, `openssl rand -base64 32` para `salt`/`nextauth-secret`) e trate
-`secrets.yaml` como um arquivo sensível — **não commitar em Git com valores reais**
-(adicione ao `.gitignore` fora do laboratório, ou use um secret manager externo +
-`kubectl create secret` / External Secrets Operator em vez de um YAML versionado).
+  ```bash
+  cp secrets.local.yaml.example secrets.local.yaml
+  kubectl apply -f secrets.local.yaml
+  ```
 
-Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml` são
+  ⚠️ **Nunca usar `secrets.local.yaml`/`secrets.local.yaml.example` em homolog/prod** —
+  gere valores únicos (`openssl rand -hex 32` para `encryption-key`, `openssl rand
+  -base64 32` para `salt`/`nextauth-secret`) e trate `secrets.local.yaml` como arquivo
+  sensível — ele já é ignorado pelo Git, então só o `.example` (com os placeholders de
+  laboratório) fica versionado.
+
+Os caminhos corretos no chart usados por `values.yaml` são
 `langfuse.salt.secretKeyRef`, `langfuse.encryptionKey.secretKeyRef`,
 `langfuse.nextauth.secret.secretKeyRef`, `langfuse.additionalEnv[].valueFrom.secretKeyRef`
 (para `DATABASE_URL` e os `LANGFUSE_INIT_*`), `redis.auth.existingSecret`/
@@ -201,7 +324,7 @@ Os caminhos corretos no chart usados por `web.yaml`/`worker.yaml` são
 Secret **`langfuse-secrets`** (não `langfuse.env.*`, que não existe no schema do chart,
 nem um nome de Secret diferente em qualquer arquivo — isso quebra o deploy).
 
-Ajuste também a URL pública em `langfuse.nextauth.url` (`web.yaml`/`worker.yaml`) para
+Ajuste também a URL pública em `langfuse.nextauth.url` (`values.yaml`) para
 o domínio real antes de aplicar em produção.
 
 ---
@@ -211,8 +334,7 @@ o domínio real antes de aplicar em produção.
 ```bash
 helm template langfuse langfuse/langfuse \
   -n langfuse \
-  -f web.yaml \
-  -f worker.yaml \
+  -f values.yaml \
   > /tmp/langfuse-rendered.yaml
 
 # Revise o manifesto renderizado antes de aplicar
@@ -251,7 +373,7 @@ editar os arquivos — por exemplo, com um Postgres e S3 (MinIO) locais:
 
 ⚠️ Como não há mais Postgres bundled nesta stack, testar no Kind exige um Postgres
 real acessível (ex: `docker run postgres:18` na mesma rede, ou reaproveitar o
-`docker-compose/` para só o banco) — aponte `DATABASE_URL` em `secrets.yaml` para ele.
+`docker-compose/` para só o banco) — aponte `DATABASE_URL` em `secrets.local.yaml` para ele.
 
 (`className: ""` faz o cluster usar a StorageClass default — no Kind, `standard`.)
 
@@ -265,8 +387,7 @@ real acessível (ex: `docker run postgres:18` na mesma rede, ou reaproveitar o
 ```bash
 helm install langfuse langfuse/langfuse \
   -n langfuse \
-  -f web.yaml \
-  -f worker.yaml \
+  -f values.yaml \
   --wait --timeout 10m
 ```
 
@@ -297,8 +418,9 @@ kubectl port-forward -n langfuse svc/langfuse-web 3000:3000
 ```
 
 Acesse `http://localhost:3000` e faça login com as credenciais de
-`LANGFUSE_INIT_USER_EMAIL`/`LANGFUSE_INIT_USER_PASSWORD` em `secrets.yaml` — a
-organização, o projeto e o usuário já foram criados automaticamente no primeiro start
+`LANGFUSE_INIT_USER_EMAIL`/`LANGFUSE_INIT_USER_PASSWORD` (Kind: `secrets.local.yaml`;
+homolog/prod: parâmetros `init-user-email`/`init-user-password` no Parameter Store) —
+a organização, o projeto e o usuário já foram criados automaticamente no primeiro start
 (headless initialization), sem precisar passar pela tela de "Sign up".
 
 ### Via scripts de teste do SDK
@@ -307,9 +429,17 @@ organização, o projeto e o usuário já foram criados automaticamente no prime
 cd tests
 pip install langfuse python-dotenv
 
+# Kind/lab (valores de secrets.local.yaml):
 cat <<EOF > .env
-LANGFUSE_PUBLIC_KEY=$(grep LANGFUSE_INIT_PROJECT_PUBLIC_KEY ../secrets.yaml | cut -d'"' -f2)
-LANGFUSE_SECRET_KEY=$(grep LANGFUSE_INIT_PROJECT_SECRET_KEY ../secrets.yaml | cut -d'"' -f2)
+LANGFUSE_PUBLIC_KEY=$(grep LANGFUSE_INIT_PROJECT_PUBLIC_KEY ../secrets.local.yaml | cut -d'"' -f2)
+LANGFUSE_SECRET_KEY=$(grep LANGFUSE_INIT_PROJECT_SECRET_KEY ../secrets.local.yaml | cut -d'"' -f2)
+LANGFUSE_HOST=http://localhost:3000
+EOF
+
+# Homolog/prod (valores no Parameter Store):
+cat <<EOF > .env
+LANGFUSE_PUBLIC_KEY=$(aws ssm get-parameter --name "/langfuse/<AMBIENTE>/init-project-public-key" --with-decryption --query Parameter.Value --output text)
+LANGFUSE_SECRET_KEY=$(aws ssm get-parameter --name "/langfuse/<AMBIENTE>/init-project-secret-key" --with-decryption --query Parameter.Value --output text)
 LANGFUSE_HOST=http://localhost:3000
 EOF
 
@@ -323,15 +453,29 @@ Langfuse (`http://localhost:3000` → seção *Traces*).
 
 ---
 
-## 8. Atualizar segredos (secrets.yaml) após o deploy inicial
+## 8. Atualizar segredos após o deploy inicial
+
+**Homolog/prod** (Parameter Store): atualize o parâmetro e aguarde o `refreshInterval`
+do `ExternalSecret` (1h) recriar o Secret — ou force a sincronização imediata:
 
 ```bash
-kubectl apply -f secrets.yaml
+aws ssm put-parameter --region "<SUA_REGIAO_AWS>" --type SecureString --overwrite \
+  --name "/langfuse/<AMBIENTE>/<PARAMETRO>" --value "<NOVO_VALOR>"
+
+kubectl annotate externalsecret langfuse-secrets -n langfuse \
+  force-sync=$(date +%s) --overwrite
 kubectl rollout restart deployment/langfuse-web deployment/langfuse-worker -n langfuse
 ```
 
-`secretKeyRef` não é recarregado a quente pelo Kubernetes — os pods só leem o valor
-novo depois de recriados (`rollout restart`).
+**Kind/lab** (`secrets.local.yaml`):
+
+```bash
+kubectl apply -f secrets.local.yaml
+kubectl rollout restart deployment/langfuse-web deployment/langfuse-worker -n langfuse
+```
+
+Em ambos os casos, `secretKeyRef` não é recarregado a quente pelo Kubernetes — os pods
+só leem o valor novo depois de recriados (`rollout restart`).
 
 ⚠️ **Gotcha do bootstrap headless**: ele só *cria* recursos que não existem — não
 *atualiza* os existentes. Se você mudar `LANGFUSE_INIT_PROJECT_PUBLIC_KEY`/
@@ -349,8 +493,7 @@ Se `DATABASE_URL` mudar para apontar a outro RDS, o `rollout restart` é suficie
 ```bash
 helm upgrade langfuse langfuse/langfuse \
   -n langfuse \
-  -f web.yaml \
-  -f worker.yaml \
+  -f values.yaml \
   --wait --timeout 10m
 ```
 
@@ -387,9 +530,9 @@ O RDS (externo) não é afetado pelo `helm uninstall` — gerenciado fora do Hel
 - [ ] Namespace `langfuse` criado
 - [ ] Repositório Helm adicionado/atualizado
 - [ ] Repositórios ECR criados e imagens (web/worker) buildadas e enviadas (seção 0.6)
-- [ ] Instância RDS provisionada e acessível; `DATABASE_URL` em `secrets.yaml` aponta pra ela
-- [ ] `secrets.yaml` aplicado (`kubectl apply -f secrets.yaml`) — com valores próprios em homolog/prod, não os de laboratório
-- [ ] Placeholders `<...>` substituídos em `web.yaml`/`worker.yaml` (domínio, ARNs, bucket, região, account ID, repo ECR)
+- [ ] Instância RDS provisionada e acessível; parâmetro `database-url` no Parameter Store (homolog/prod) ou `DATABASE_URL` em `secrets.local.yaml` (Kind) aponta pra ela
+- [ ] External Secrets Operator instalado e parâmetros criados no Parameter Store (seção 0.7); `external-secrets/*.yaml` aplicados e `kubectl get secret langfuse-secrets -n langfuse` existe — **ou**, só em Kind/lab, `secrets.local.yaml` aplicado (`kubectl apply -f secrets.local.yaml`)
+- [ ] Placeholders `<...>` substituídos em `values.yaml`/`external-secrets/*.yaml` (domínio, ARNs, bucket, região, account ID, repo ECR)
 - [ ] Pré-requisitos de EKS prontos (seção 0.5) — ou overrides de Kind aplicados (seção 4.1)
 - [ ] `helm template` revisado antes do `install`
 - [ ] Release instalado com nome exato `langfuse`

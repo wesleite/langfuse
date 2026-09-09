@@ -1,4 +1,4 @@
 # Segredos — nunca versionar, mesmo valores de laboratório (ver README.md, seção 5)
-secrets.yaml
+secrets.local.yaml
 tests/.env
 docker-compose/.env
