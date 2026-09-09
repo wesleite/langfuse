@@ -1,0 +1,22 @@
+image:
+  repository: public.ecr.aws/g6y2f6g9/k8s-cleaner
+  tag: v1.0.0
+  pullPolicy: Always
+
+cronjob:
+  schedule: "*/10 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources: {}
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+env: []

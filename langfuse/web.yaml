@@ -1,0 +1,86 @@
+# ==============================================================================
+# Configurações do Langfuse - Web (App) + segredos/env compartilhados
+# ------------------------------------------------------------------------------
+# Credenciais vêm do Secret "langfuse" (namespace "langfuse") definido em
+# secrets.yaml — aplicar com `kubectl apply -f secrets.yaml` ANTES do
+# helm install/upgrade (ver DEPLOY.md).
+#
+# Correção: `langfuse.replicaCount` e `langfuse.env` não existem no schema real
+# do chart (chaves antigas eram silenciosamente ignoradas). As chaves corretas
+# são `langfuse.web.replicas` e a config estruturada de S3 em `s3:` (values.yaml).
+# ==============================================================================
+langfuse:
+  salt:
+    secretKeyRef:
+      name: langfuse
+      key: salt
+  encryptionKey:
+    secretKeyRef:
+      name: langfuse
+      key: encryption-key
+  nextauth:
+    url: "http://localhost:3000"
+    secret:
+      secretKeyRef:
+        name: langfuse
+        key: nextauth-secret
+
+  # Headless initialization (cria org/projeto/usuário/API key no 1º start,
+  # sem precisar passar pela tela de "Sign up" na UI) — só para laboratório.
+  # https://langfuse.com/self-hosting/administration/headless-initialization
+  additionalEnv:
+    - name: LANGFUSE_INIT_ORG_ID
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_ORG_ID
+    - name: LANGFUSE_INIT_ORG_NAME
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_ORG_NAME
+    - name: LANGFUSE_INIT_PROJECT_ID
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_PROJECT_ID
+    - name: LANGFUSE_INIT_PROJECT_NAME
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_PROJECT_NAME
+    - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+    - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_PROJECT_SECRET_KEY
+    - name: LANGFUSE_INIT_USER_EMAIL
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_USER_EMAIL
+    - name: LANGFUSE_INIT_USER_NAME
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_USER_NAME
+    - name: LANGFUSE_INIT_USER_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: langfuse
+          key: LANGFUSE_INIT_USER_PASSWORD
+
+  web:
+    replicas: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "1Gi"
+      limits:
+        cpu: "1000m"
+        memory: "2Gi"

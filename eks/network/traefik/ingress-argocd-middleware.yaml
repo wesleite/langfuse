@@ -1,0 +1,28 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: argocd-stripprefix
+  namespace: traefik
+spec:
+  stripPrefix:
+    prefixes:
+      - /argocd
+      - /argocd/
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: argocd-server-ingress
+  namespace: traefik
+spec:
+  entryPoints:
+  - web
+  routes:
+  - kind: Rule
+    match: Host(`k8s-traefik-traefik-b29027a8f9-d82e520fea029e25.elb.us-west-2.amazonaws.com`) && PathPrefix(`/argocd`)
+    middlewares:
+    - name: argocd-stripprefix
+    services:
+    - name: argocd-server
+      namespace: argocd
+      port: 80

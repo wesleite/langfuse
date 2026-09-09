@@ -1,0 +1,30 @@
+# ==============================================================================
+# Configurações do Redis / Valkey
+# ------------------------------------------------------------------------------
+# Credenciais vêm do Secret "langfuse" (secrets.yaml). Duas referências
+# distintas ao mesmo Secret:
+#  - auth.existingSecret + existingSecretPasswordKey: senha que a app usa
+#    (REDIS_AUTH).
+#  - auth.usersExistingSecret: Secret com 1 chave por usuário ACL, consumido
+#    diretamente pelo subchart valkey-io/valkey (chave "default" = o mesmo
+#    usuário configurado em auth.username).
+# ==============================================================================
+redis:
+  deploy: true
+  host: "langfuse-redis"
+  port: 6379
+
+  auth:
+    enabled: true
+    username: "default"
+    existingSecret: langfuse
+    existingSecretPasswordKey: redis-password
+    usersExistingSecret: langfuse
+
+  resources:
+    requests:
+      cpu: "25m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"

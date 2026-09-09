@@ -1,0 +1,34 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: prometheus-virtualservice
+  namespace: monitoring
+spec:
+  hosts:
+    - "prometheus.${dns_domain}"
+  gateways:
+    - prometheus-gateway
+  http:
+    - match:
+        - port: 10901
+      route:
+        - destination:
+            host: kube-prometheus-stack-thanos-discovery
+            port:
+              number: 10901
+
+    - match:
+        - port: 80
+      redirect:
+        scheme: https
+        port: 443
+        redirectCode: 308
+
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: kube-prometheus-stack-prometheus
+            port:
+              number: 9090

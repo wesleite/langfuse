@@ -1,0 +1,17 @@
+replicaCount: 1
+
+image:
+  repository: public.ecr.aws/g6y2f6g9/aws-iam-role-injector
+  tag: v1.0.0
+  pullPolicy: Always
+
+certManager:
+  enabled: true
+
+resources: {}
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+env: []

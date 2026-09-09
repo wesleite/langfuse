@@ -1,0 +1,32 @@
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: prometheus-gateway
+  namespace: monitoring
+spec:
+  selector:
+    istio: gateway-private
+  servers:
+  - port:
+      number: 10901
+      name: grpc
+      protocol: GRPC
+    hosts:
+      - "prometheus.${dns_domain}"
+  - port:
+      number: 80
+      name: http
+      protocol: HTTP
+    hosts:
+      - "prometheus.${dns_domain}"
+  - port:
+      number: 443
+      name: https
+      protocol: %{ if cloud_provider == "azure" }HTTPS%{ else }HTTP%{ endif }
+    hosts:
+      - "prometheus.${dns_domain}"
+%{ if cloud_provider == "azure" }
+    tls:
+      mode: SIMPLE
+      credentialName: wildcard-tls
+%{ endif }
