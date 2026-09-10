@@ -70,6 +70,21 @@ langfuse:
     annotations:
       eks.amazonaws.com/role-arn: "arn:aws:iam::<SEU_ACCOUNT_ID>:role/<NOME_DA_ROLE_IRSA>"
 
+  # Hardening a nível de Pod/Container (chart não aplica nada por default —
+  # langfuse.podSecurityContext/langfuse.securityContext vêm {} de fábrica).
+  # readOnlyRootFilesystem não foi setado: não validado se o Next.js standalone
+  # (web) e o worker escrevem em caminhos fora de volumes montados.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   ingress:
     enabled: true
     className: alb
@@ -100,6 +115,14 @@ langfuse:
       limits:
         cpu: "1"
         memory: "2Gi"
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      create: true
+      maxUnavailable: 1
 
   worker:
     replicas: 2
@@ -114,6 +137,14 @@ langfuse:
       limits:
         cpu: "1"
         memory: "2Gi"
+    hpa:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 4
+      targetCPUUtilizationPercentage: 70
+    pdb:
+      create: true
+      maxUnavailable: 1
 
 postgresql:
   deploy: false
